@@ -89,6 +89,11 @@ jobs:
         shell: bash
         env:
           ENVTEST_VERSION: ${{ inputs.envtest-version }}
+          # setup-go exports GOTOOLCHAIN=local, but setup-envtest needs a newer Go than
+          # many repos pin (release-0.22 needs go >= 1.24): let `go install` fetch the
+          # toolchain the tool's go.mod names (checksum-verified). The repo's own tests
+          # still run on its pinned Go.
+          GOTOOLCHAIN: auto
         run: |
           set -euo pipefail
           go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${ENVTEST_VERSION}"
