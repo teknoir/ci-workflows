@@ -752,6 +752,10 @@ jobs:
           target: ${{ inputs.target }}
           build-args: ${{ steps.args.outputs.build_args }}
           tags: ${{ steps.meta.outputs.tags }}
+          # revision/source on every image, so pin-image and reviewers can trace a digest to its commit.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           outputs: type=registry,rewrite-timestamp=true
           provenance: false
           sbom: false

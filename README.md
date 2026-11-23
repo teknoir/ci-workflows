@@ -171,6 +171,9 @@ The build and push step pushes only the `sha-<8>` tag (and, on a public `v*`
 build, the tag name; on a tag build with `tag-build-args`, the tag name only).
 The `version-file` tag is added afterwards, by the separate `version-tag` job
 (below).
+Every image carries the OCI labels `org.opencontainers.image.revision` (the
+built commit) and `org.opencontainers.image.source` (the repository URL), set
+by the workflow over any Dockerfile `LABEL` of the same name.
 
 **Templated `build-args`.** A `build-args` value may use placeholders, with the
 same `KEY=VALUE` per-line format:
