@@ -1,6 +1,6 @@
 # Runner image for the dev-host ARC scale sets (teknoir-ci, teknoir-land, teknoir-push).
 # The upstream actions-runner image has no make, gcc or gh; land.sh needs gh, and most repos need make.
-# shellcheck, openssl, pip, PyYAML, helm and luajit are what the repos' old vpro CI images provided.
+# shellcheck, openssl, pip, PyYAML, helm, luajit and git-lfs are what the repos' old vpro CI images provided.
 # Bump BASE together with the ARC values in platform-applications-gitops charts/ci-runners/arc/*.yaml.
 ARG BASE=ghcr.io/actions/actions-runner:2.338.2@sha256:6d0b2d80d80f143f77dcb676e50920100bbb547e39e883454d57f45ab8c31300
 FROM ${BASE}
@@ -16,7 +16,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg build-essential make xz-utils zstd \
-      shellcheck openssl python3-pip python3-yaml luajit; \
+      shellcheck openssl python3-pip python3-yaml luajit git-lfs; \
     install -m 0755 -d /etc/apt/keyrings; \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
     chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg; \
@@ -32,5 +32,5 @@ RUN set -eux; \
     tar -xzf /tmp/helm.tgz -C /usr/local/bin --strip-components=1 "linux-${arch}/helm"; \
     rm -f /tmp/helm.tgz /tmp/helm.tgz.sha256; \
     rm -rf /var/lib/apt/lists/*; \
-    make --version | head -1; gcc --version | head -1; gh --version | head -1; yq --version; helm version --short; shellcheck --version | head -2; openssl version; python3 -c 'import yaml; print(yaml.__version__)'; pip3 --version; luajit -v
+    make --version | head -1; gcc --version | head -1; gh --version | head -1; yq --version; helm version --short; shellcheck --version | head -2; openssl version; python3 -c 'import yaml; print(yaml.__version__)'; pip3 --version; luajit -v; git lfs version
 USER runner
