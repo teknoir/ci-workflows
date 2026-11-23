@@ -1,0 +1,49 @@
+name: lint
+
+# This repo's own check: every workflow (examples included) parses and is
+# shell-clean, and the land.sh helpers pass their tests.
+# The job name is exactly `actionlint`: a ruleset requires that check name.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+
+      - name: Lint workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./actionlint -color .github/workflows/*.yml examples/*/*.yml
+
+      - name: Lint scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck scripts/*.sh
+
+      - name: Test land.sh helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-land.sh

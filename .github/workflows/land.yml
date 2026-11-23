@@ -1,0 +1,259 @@
+name: land (reusable)
+
+# The merge gate for private repos (GitHub Free has no branch protection).
+# Three jobs, so that PR code never runs with a write token:
+#   test     read-only token: selects the PR and checks state, label, base and
+#            head; prepares the tree (check out, merge the base); runs the
+#            command on it last, in a step that writes no outputs.
+#   merge    write token, no PR checkout: re-checks through the API, then
+#            squash-merges exactly the tested commit and dispatches.
+#   cleanup  pull-requests write: removes the label and comments when the run
+#            failed, was cancelled, or invalidated the label.
+# Triggered by the caller on pull_request [labeled, synchronize, reopened],
+# schedule and workflow_dispatch. Logic lives in scripts/land.sh.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label or ARC scale-set name.
+        type: string
+        default: teknoir-land
+      label:
+        description: Label that asks for a landing.
+        type: string
+        default: ready-to-land
+      command:
+        description: Test command, run on the PR merged with the base branch.
+        type: string
+        default: ./scripts/test
+      go-version-file:
+        description: File holding the Go version (e.g. go.mod). Empty skips setup-go.
+        type: string
+        default: ''
+      node-version-file:
+        description: File holding the Node version (e.g. .nvmrc). Empty skips setup-node.
+        type: string
+        default: ''
+      setup-envtest:
+        description: Install setup-envtest and export KUBEBUILDER_ASSETS (1.34.x).
+        type: boolean
+        default: false
+      envtest-version:
+        description: setup-envtest release tag to install.
+        type: string
+        default: release-0.22
+      timeout-minutes:
+        description: Job timeout in minutes.
+        type: number
+        default: 45
+      image-workflow:
+        description: Workflow file to dispatch on the base branch after a merge, e.g. image.yml.
+        type: string
+        default: ''
+      test-workflow:
+        description: >-
+          Test workflow file to dispatch on the base branch when the merge
+          landed on a base that was not tested, e.g. test.yml. Empty: none.
+        type: string
+        default: ''
+      base:
+        description: Branch to merge into.
+        type: string
+        default: main
+      ci-workflows-ref:
+        description: >-
+          Ref of teknoir/ci-workflows whose scripts/land.sh runs. Keep it equal
+          to the ref in your `uses:` line (only changed to test a branch).
+        type: string
+        default: main
+
+permissions: {}
+
+jobs:
+  test:
+    name: test
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      pr: ${{ steps.select.outputs.pr }}
+      head_sha: ${{ steps.select.outputs.head_sha }}
+      skip: ${{ steps.select.outputs.skip }}
+      invalidations: ${{ steps.select.outputs.invalidations }}
+      base_tested: ${{ steps.prepare.outputs.base_tested }}
+      comment: ${{ steps.prepare.outputs.comment }}
+    env:
+      GH_REPO: ${{ github.repository }}
+      GITHUB_RUN_ID: ${{ github.run_id }}
+      LABEL: ${{ inputs.label }}
+      BASE: ${{ inputs.base }}
+      COMMAND: ${{ inputs.command }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_ACTION: ${{ github.event.action }}
+      EVENT_PR: ${{ github.event.pull_request.number }}
+      EVENT_LABEL: ${{ github.event.label.name }}
+      EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # The runner has no shared cache: keep every toolchain cache on the
+      # job's own /scratch emptyDir, so no other job's cache is reused here.
+      GOMODCACHE: /scratch/go-mod
+      GOCACHE: /scratch/go-build
+      YARN_CACHE_FOLDER: /scratch/yarn
+      npm_config_cache: /scratch/npm
+    steps:
+      # The caller repo first: a later checkout cleans its own path only, so
+      # `.ci-workflows` survives. A second checkout into the workspace root
+      # would git-clean it away. No credentials on disk: the fetch below
+      # authenticates on the command line, in a step that runs no PR code.
+      - name: Checkout the caller repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout ci-workflows
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: teknoir/ci-workflows
+          ref: ${{ inputs.ci-workflows-ref }}
+          path: .ci-workflows
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Reads-only gh calls and the authenticated fetches. No PR code.
+      - name: Select the pull request
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .ci-workflows/scripts/land.sh select
+
+      # Checks the PR head out and merges the base into it: no PR code runs
+      # here, so this step may write the outputs the cleanup job posts.
+      - name: Prepare the tree
+        id: prepare
+        if: steps.select.outputs.skip != 'true' && steps.select.outputs.pr != ''
+        shell: bash
+        env:
+          PR: ${{ steps.select.outputs.pr }}
+          HEAD_SHA: ${{ steps.select.outputs.head_sha }}
+        run: env -u GH_TOKEN -u GITHUB_TOKEN bash .ci-workflows/scripts/land.sh prepare
+
+      # Read the version files from the prepared tree, not from main.
+      - name: Set up Go
+        if: steps.select.outputs.skip != 'true' && inputs.go-version-file != ''
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: false
+
+      - name: Set up Node
+        if: steps.select.outputs.skip != 'true' && inputs.node-version-file != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: ''
+
+      - name: Set up envtest
+        if: steps.select.outputs.skip != 'true' && inputs.setup-envtest
+        shell: bash
+        env:
+          ENVTEST_VERSION: ${{ inputs.envtest-version }}
+        run: |
+          set -euo pipefail
+          # The runner's per-job GOMODCACHE and GOCACHE, never a shared one.
+          go install "sigs.k8s.io/controller-runtime/tools/setup-envtest@${ENVTEST_VERSION}"
+          KUBEBUILDER_ASSETS="$("$(go env GOPATH)/bin/setup-envtest" use -p path --bin-dir "${RUNNER_TOOL_CACHE}/envtest" 1.34.x)"
+          test -d "$KUBEBUILDER_ASSETS"
+          echo "KUBEBUILDER_ASSETS=${KUBEBUILDER_ASSETS}" >> "$GITHUB_ENV"
+
+      # PR code runs here: no token in the environment, and the step writes
+      # no outputs (the cleanup job never reads text this step produced).
+      - name: Test
+        id: test
+        if: steps.select.outputs.skip != 'true' && steps.select.outputs.pr != ''
+        shell: bash
+        env:
+          PR: ${{ steps.select.outputs.pr }}
+          BASE_TESTED: ${{ steps.prepare.outputs.base_tested }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          GOTOOLCHAIN: local
+        run: bash .ci-workflows/scripts/land.sh test
+
+  merge:
+    name: merge
+    needs: test
+    if: needs.test.outputs.skip != 'true' && needs.test.result == 'success'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LABEL: ${{ inputs.label }}
+      BASE: ${{ inputs.base }}
+      IMAGE_WORKFLOW: ${{ inputs.image-workflow }}
+      TEST_WORKFLOW: ${{ inputs.test-workflow }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # owner/repo/.github/workflows/<file>@<ref>; land.sh keeps the file name.
+      CALLER_WORKFLOW: ${{ github.workflow_ref }}
+      PR: ${{ needs.test.outputs.pr }}
+      HEAD_SHA: ${{ needs.test.outputs.head_sha }}
+      BASE_TESTED: ${{ needs.test.outputs.base_tested }}
+    steps:
+      # The script only; no checkout of PR code in this job.
+      - name: Checkout ci-workflows
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: teknoir/ci-workflows
+          ref: ${{ inputs.ci-workflows-ref }}
+          path: .ci-workflows
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Merge
+        shell: bash
+        run: bash .ci-workflows/scripts/land.sh merge
+
+  cleanup:
+    name: cleanup
+    needs: [test, merge]
+    if: >-
+      always() && (failure() || cancelled() ||
+      needs.test.outputs.invalidations != '')
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LABEL: ${{ inputs.label }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      PR: ${{ needs.test.outputs.pr }}
+      BASE_TESTED: ${{ needs.test.outputs.base_tested }}
+      INVALIDATIONS: ${{ needs.test.outputs.invalidations }}
+      COMMENT: ${{ needs.test.outputs.comment }}
+      TEST_RESULT: ${{ needs.test.result }}
+      MERGE_RESULT: ${{ needs.merge.result }}
+    steps:
+      - name: Checkout ci-workflows
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: teknoir/ci-workflows
+          ref: ${{ inputs.ci-workflows-ref }}
+          path: .ci-workflows
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Clean up
+        shell: bash
+        run: bash .ci-workflows/scripts/land.sh cleanup

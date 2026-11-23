@@ -1,0 +1,25 @@
+name: image
+
+on:
+  # Private images build refs/heads/main only; a release tag re-tags the
+  # digest built on main later (docker buildx imagetools create).
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'
+
+concurrency:
+  group: image-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  image:
+    uses: teknoir/ci-workflows/.github/workflows/image.yml@main
+    with:
+      image: <repo-name> # e.g. backstage; replace when copying this file
+    permissions:
+      contents: read
+      packages: write

@@ -1,0 +1,30 @@
+name: land
+
+# The merge gate. Add the `ready-to-land` label to a PR after review; the
+# land job merges the PR head with main, tests that tree and squash-merges it.
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name != 'ready-to-land') && format('land-sync-{0}-{1}', github.repository, github.event.pull_request.number) || format('land-{0}', github.repository) }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  land:
+    uses: teknoir/ci-workflows/.github/workflows/land.yml@main
+    with:
+      command: ./scripts/test
+      node-version-file: .nvmrc
+      image-workflow: image.yml
+      test-workflow: test.yml
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
