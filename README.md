@@ -154,14 +154,134 @@ Builds one image and pushes `sha-<8>`:
 
 `latest` and branch-name tags are refused. The build is skipped when the
 `sha-<8>` tag already exists, and any other tag in the list that is missing is
-then created from it. Inputs: `image` (required), `context`, `file`,
-`platforms` (`linux/amd64`), `target`, `build-args`, `empty-files` (empty placeholder files to create, one relative path per line; allowed on private builds), `pre-build` (public
+then created from it (a registry error while checking is an `::error::` and
+fails the job rather than rebuilding). The one exception is a tag build with
+`tag-build-args` set: it pushes no `sha-<8>` and is checked on its tag name
+instead (see `tag-build-args` below). `image` must be a lowercase repository
+name without registry or tag (`backstage`, `toe-app`), since the destinations
+are `<registry>/teknoir/<image>`. Inputs: `image` (required), `context`, `file`,
+`platforms` (`linux/amd64`), `target`, `build-args`, `tag-build-args`,
+`version-file`,
+`empty-files` (empty placeholder files to create, one relative path per line; allowed on private builds), `pre-build` (public
 builds only; a private build with `pre-build` fails in the ref step), `lfs`,
 `visibility` (`private`/`public`), `runs-on` (`teknoir-push`),
 `timeout-minutes` (60).
+
+The build and push step pushes only the `sha-<8>` tag (and, on a public `v*`
+build, the tag name; on a tag build with `tag-build-args`, the tag name only).
+The `version-file` tag is added afterwards, by the separate `version-tag` job
+(below).
+
+**Templated `build-args`.** A `build-args` value may use placeholders, with the
+same `KEY=VALUE` per-line format:
+
+| Placeholder | Expands to |
+| --- | --- |
+| `{sha8}` | first 8 characters of `GITHUB_SHA` |
+| `{sha7}` | first 7 characters of `GITHUB_SHA` |
+| `{sha}` | full `GITHUB_SHA` |
+| `{ref}` | `GITHUB_REF_NAME` with `/` replaced by `-` (e.g. `feature-x`, `v1.2.3`) |
+| `{version}` | the trimmed content of `version-file` (needs `version-file`) |
+
+The expansion runs in a bash step and the result is what reaches the build;
+the raw input is never interpolated into `run:` (it arrives through `env:`).
+An unknown `{placeholder}`, or `{version}` without `version-file`, fails the job
+with `::error::` naming the placeholder. The helpers live in
+`.github/workflows/image.yml` (inline copies, one per bash step) and
+`scripts/image-lib.sh`, which must stay identical (`lint.yml` diffs every copy;
+`scripts/test-image-lib.sh` and `scripts/test-image-steps.sh` test them).
+
+**`tag-build-args`.** Same format and placeholders as `build-args`, merged
+over it when the ref is a tag (`refs/tags/*`), so a tag build can bake a
+different version string into the binary (vpro's `tagBuildArgs`). A key in
+both keeps the `tag-build-args` value; a key only in `tag-build-args` is
+appended. On a branch, `tag-build-args` is ignored.
+
+When it is non-empty on a tag, the tag build pushes **only** `<dest>:<tag>`
+and never `sha-<8>` (vpro's `keep_ref`), so the branch artifact stays
+immutable and the tag's build args really reach the released binary. The
+`<dest>:<sha-<8>>` shortcut is not used for such a build: each destination's
+`<dest>:<tag>` is checked with the tri-state helper instead.
+
+| `<dest>:<tag>` on the destinations | Result |
+| --- | --- |
+| absent everywhere | build and push `:<tag>` with the tag's merged args |
+| present in every destination | skip the build (existing content is never overwritten) |
+| present in some, absent in others | `::error::`, job fails; one release is never split across destinations |
+| any read error | `::error::`, fails closed |
+
+The image job's `tag` output is the tag name on such a build, so the
+`version-tag` job tags `:<version>` from `:<tag>`.
+
+```yaml
+# wg-hub (vpro: repos/wg-tunnel.yaml): the tag build bakes VERSION=v1.2.3
+# and pushes only :v1.2.3; a branch build bakes VERSION=main-abc1234 in
+# sha-<8>
+    with:
+      image: wg-hub
+      context: .
+      target: wg-hub
+      platforms: linux/amd64,linux/arm64
+      visibility: public
+      runs-on: ubuntu-latest
+      build-args: |
+        VERSION={ref}-{sha7}
+      tag-build-args: |
+        VERSION={ref}
+```
+
+**`version-file`.** When set, the file (at the checked-out sha) must hold
+`^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$`, e.g. `1.2.3` or
+`1.2.3-rc.1`; anything else fails the job. `{version}` is the raw trimmed
+content. The image tag is that value mapped the way vpro's `safe_tag` mapped
+it: every character outside `[A-Za-z0-9_.-]` becomes `-` (so `1.2.3+build.1`
+tags as `1.2.3-build.1`) and the result is capped at 128 characters. The
+`version-tag` job then adds `:<version>` to **every** destination.
+
+A version names an immutable release, so the `version-tag` job checks each
+destination separately, and fails closed: a registry answer that is not a
+positive "not found" (`429`, `5xx`, auth error, timeout) is an `::error::` and
+fails the job rather than being read as "missing".
+
+| State of `<dest>:<version>` across the destinations | Result |
+| --- | --- |
+| absent everywhere | each created from its own `<dest>:sha-<8>` (or `<dest>:<tag>` on a tag build with `tag-build-args`) |
+| present somewhere, one digest | missing ones created from that digest (`imagetools create -t <dest>:<version> <present_dest>@<digest>`); present ones untouched |
+| present somewhere with one digest, which this commit's tag does not share | `::warning::` (the version belongs to another commit), nothing overwritten; the missing destinations still get the existing digest |
+| present with different digests on different destinations | `::error::` naming both digests, job fails, nothing written |
+| any read error | `::error::`, job fails, nothing written |
+
+The present digest is the release's content: a later commit that still carries
+the same version never changes what `:<version>` means, it only fills in a
+destination an earlier run left out.
+
+The job runs only when `version-file` is set and the `image` job succeeded
+(built or skipped), in a per-image, per-version concurrency group
+(`ci-workflows-image-version-<repo>-<image>-<version>`,
+`cancel-in-progress: false`), so two commits carrying the same version never
+both create it. GitHub keeps one pending job per group: a newer run for the
+same version can replace a pending one (it checks the same tag, and creates it
+only where it is still absent), while runs for different versions are in
+different groups and never cancel each other.
+
+```yaml
+# profile-plugins-helm stunnel (vpro: repos/profile-plugins-helm.yaml):
+# images/stunnel/VERSION holds e.g. 1.2.3
+    with:
+      image: stunnel
+      context: images/stunnel
+      file: images/stunnel/Dockerfile
+      platforms: linux/amd64,linux/arm64
+      visibility: public
+      runs-on: ubuntu-latest
+      version-file: images/stunnel/VERSION
+      build-args: |
+        VERSION={version}
+```
 Caller permissions: `contents: read`, `packages: write`.
 Outputs: `digest` (from the build, or read back from the existing image when
-the build was skipped), `tag`.
+the build was skipped), `tag` (`sha-<8>`, or the tag name on a tag build with
+`tag-build-args`).
 
 The checkout keeps no credentials on disk (`persist-credentials: false`); the
 one fetch (`git fetch --no-tags origin main`, for the ancestor check of a
@@ -181,17 +301,87 @@ comes from the commit date and the exporter rewrites timestamps.
 
 ### `chart-release.yml` (reusable)
 
-Publishes every chart under `charts-dir` with chart-releaser (`skip_existing`),
-from `main` only: the first step fails with `::error::` on any other ref. A
-published chart version is never changed or deleted; bump the version. Inputs:
-`charts-dir` (`charts`), `runs-on` (`ubuntu-latest`), `helm-version`
-(`v3.19.0`). Caller permissions: `contents: write`.
+Publishes every chart with chart-releaser (`skip_existing`). The prerelease
+version check reads each chart's `version:` in `<charts-dir>/<chart>/Chart.yaml`
+(the layout chart-releaser packages; subcharts under `<chart>/charts` are
+packaging input, not releases). A published chart version is never changed or
+deleted; bump the version.
+
+**Refs.** Releases come from `release-branch` (default `main`);
+`prerelease-branch` (default empty, e.g. `beta`) adds a second accepted ref.
+Any other ref fails with `::error::`. The first step classifies the run:
+
+- **Release branch:** as in vpro, no version check: the branch publishes
+  whatever versions its charts carry. `ros-helm`, `triton-helm`, `deadend-helm`
+  and `trust-chain-helm` release prerelease versions (`0.3.0-rc.1`,
+  `0.0.0-alpha.3`) from `main` and rely on this.
+- **Prerelease branch:** with `prerelease-version-check` (default `true`) every
+  chart version must match `X.Y.Z-something` (`^[0-9]+\.[0-9]+\.[0-9]+-.+`),
+  else the job fails naming the chart and version. The release is marked
+  not-latest (`mark_as_latest: false`) so a beta never becomes the chart repo's
+  latest version. Set `prerelease-version-check: false` for a repo whose beta
+  branch releases versions without a prerelease suffix (`observatory-pipeline-helm`
+  did this in vpro).
+
+Concurrency is per ref: `ci-workflows-chart-release-<repo>-<ref>`,
+`cancel-in-progress: false`, so release and prerelease runs of one branch
+never overlap (both push gh-pages) and a run on one branch can never replace a
+pending run on the other. GitHub still keeps only one pending job per group: a
+newer push on the same branch can replace a pending run, so that run never
+executes. The next push usually catches up (chart-releaser packages the charts
+changed since the last tag); if a release is missing after that, rerun the
+workflow with `workflow_dispatch` on that branch. Main and beta can now push
+gh-pages at the same time; if a simultaneous index push makes chart-releaser's
+index step fail (its `git pull` aborts), the job checks that every package of
+this run already has its uploaded release, refreshes `origin/gh-pages` and runs
+only `cr index --push` again (up to 3 times, 15/30/45 s apart), from the same
+package files, so the index digest matches the uploaded asset. A successful
+retry leaves the run green. Any other chart-releaser failure (packaging,
+upload) is not retried and the run is red: fix the cause and rerun at the same
+sha (a newer commit does not repackage that chart); rerunning is safe.
+
+Inputs: `charts-dir` (`charts`), `runs-on` (`ubuntu-latest`), `helm-version`
+(`v3.19.0`), `release-branch` (`main`), `prerelease-branch` (empty),
+`prerelease-version-check` (`true`). Caller permissions: `contents: write`.
+
+Chart repo caller (`examples/chart/chart-release.yml`):
+
+```yaml
+on:
+  push:
+    branches: [main, beta]
+
+jobs:
+  chart-release:
+    uses: teknoir/ci-workflows/.github/workflows/chart-release.yml@main
+    with:
+      charts-dir: charts
+      release-branch: main
+      prerelease-branch: beta
+    permissions:
+      contents: write
+```
+
+A beta chart must then carry a prerelease version, e.g.:
+
+```yaml
+# charts/my-chart/Chart.yaml
+version: 1.2.3-beta.1
+```
+
+A repo releasing from a `release` branch (line-crossings) sets
+`release-branch: release` (and no `prerelease-branch`). A private chart repo
+must also pass `runs-on: teknoir-ci`: it must never run on a hosted runner.
 
 ### `lint.yml` (this repo)
 
 PR and `main` check. Job name is exactly `actionlint` (a ruleset requires that
 check name): actionlint on every workflow including `examples/`, shellcheck on
-`scripts/*.sh`, and `bash scripts/test-land.sh`.
+`scripts/*.sh`, `bash scripts/test-land.sh`, `bash scripts/test-image-lib.sh`,
+`bash scripts/test-image-steps.sh` (the bash steps of `image.yml`, extracted
+from the YAML, against a stub registry and an emulation of the runner's
+`GITHUB_OUTPUT` parser), and a diff of every inline `image-lib` copy in
+`image.yml` against `scripts/image-lib.sh`.
 
 ### `watch.yml` (this repo)
 

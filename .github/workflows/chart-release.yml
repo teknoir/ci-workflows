@@ -1,8 +1,12 @@
 name: chart-release (reusable)
 
 # Publishes every chart under charts-dir with chart-releaser to gh-pages.
-# Release only from main. A published chart version is never changed or
-# deleted (skip_existing), so bumping a version is the only way forward.
+# Releases come from release-branch (default main); when prerelease-branch is
+# set, that branch also releases, as prereleases (never marked latest). As in
+# vpro, the release branch publishes any version it is given; only the
+# prerelease branch is version-checked. A published chart version is never
+# changed or deleted (skip_existing), so bumping a version is the only way
+# forward.
 
 on:
   workflow_call:
@@ -19,6 +23,22 @@ on:
         description: Helm version to install.
         type: string
         default: v3.19.0
+      release-branch:
+        description: Branch stable releases come from.
+        type: string
+        default: main
+      prerelease-branch:
+        description: >-
+          Branch prerelease releases come from, e.g. beta. Empty: only
+          release-branch is accepted.
+        type: string
+        default: ''
+      prerelease-version-check:
+        description: >-
+          On prerelease-branch, require every chart version to be
+          X.Y.Z-something before releasing.
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -27,21 +47,86 @@ jobs:
     name: chart-release
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 30
+    # Per ref, so a prerelease push can never replace a pending release run
+    # (or the other way round). Never cancel a release in progress; GitHub
+    # still keeps only one pending job per group, so a newer push on the same
+    # branch can replace a pending run (the next run catches up).
+    concurrency:
+      group: ci-workflows-chart-release-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
-      - name: Refuse refs other than main
-        if: github.ref != 'refs/heads/main'
+      - name: Classify the ref
+        id: mode
         shell: bash
+        env:
+          RELEASE_BRANCH: ${{ inputs.release-branch }}
+          PRERELEASE_BRANCH: ${{ inputs.prerelease-branch }}
         run: |
           set -euo pipefail
-          echo "::error::chart-release publishes only from main; got ${GITHUB_REF}"
-          exit 1
+          if [[ -z "$RELEASE_BRANCH" ]]; then
+            echo "::error::chart-release: release-branch must not be empty."
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" == "refs/heads/${RELEASE_BRANCH}" ]]; then
+            mode=release
+          elif [[ -n "$PRERELEASE_BRANCH" && "${GITHUB_REF}" == "refs/heads/${PRERELEASE_BRANCH}" ]]; then
+            mode=prerelease
+          else
+            allowed="refs/heads/${RELEASE_BRANCH}"
+            if [[ -n "$PRERELEASE_BRANCH" ]]; then
+              allowed="${allowed}, refs/heads/${PRERELEASE_BRANCH}"
+            fi
+            echo "::error::chart-release publishes only from ${allowed}; got ${GITHUB_REF}."
+            exit 1
+          fi
+          {
+            echo "mode=${mode}"
+            if [[ "$mode" == release ]]; then
+              echo "mark_as_latest=true"
+            else
+              echo "mark_as_latest=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing ${mode} charts from ${GITHUB_REF}."
 
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      # chart-releaser packages every directory directly under charts-dir that
+      # holds a Chart.yaml (subcharts in charts/<chart>/charts are packaging
+      # input, not releases), so those are the charts checked here.
+      - name: Check prerelease chart versions
+        if: steps.mode.outputs.mode == 'prerelease' && inputs.prerelease-version-check
+        shell: bash
+        env:
+          CHARTS_DIR: ${{ inputs.charts-dir }}
+        run: |
+          set -euo pipefail
+          bad=0
+          found=0
+          for chart in "$CHARTS_DIR"/*/Chart.yaml; do
+            [[ -f "$chart" ]] || continue
+            found=1
+            version=$(awk '/^version:[[:space:]]*/ { sub(/^version:[[:space:]]*/, ""); gsub(/["'"'"']/, ""); print; exit }' "$chart")
+            if [[ -z "$version" ]]; then
+              echo "::error::${chart} has no version; a prerelease needs X.Y.Z-something."
+              bad=1
+              continue
+            fi
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-.+ ]]; then
+              echo "::error::${chart}: version '${version}' is not in the prerelease format X.Y.Z-something (e.g. 1.2.3-beta.1); a prerelease branch publishes only prerelease versions."
+              bad=1
+            fi
+          done
+          if [[ "$found" == 0 ]]; then
+            echo "::error::no charts found under '${CHARTS_DIR}' (expected ${CHARTS_DIR}/<chart>/Chart.yaml)."
+            exit 1
+          fi
+          exit "$bad"
 
       - name: Configure git
         shell: bash
@@ -56,9 +141,58 @@ jobs:
           version: ${{ inputs.helm-version }}
 
       - name: Run chart-releaser
+        id: cr
+        # A failure here is retried below (index push only); the retry step
+        # decides the job's result.
+        continue-on-error: true
         uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
         with:
           charts_dir: ${{ inputs.charts-dir }}
           skip_existing: true
+          # Prerelease versions must never become the chart repo's latest.
+          mark_as_latest: ${{ steps.mode.outputs.mark_as_latest }}
         env:
           CR_TOKEN: ${{ github.token }}
+
+      # A run on the other branch can push gh-pages between this run's checkout
+      # and its index push; cr's index `git pull` then aborts after cr upload
+      # has created the releases, so only the index entry is missing. Rebuild
+      # just the index from the packages this run already uploaded (same bytes,
+      # so the index digest matches the release asset), after refreshing the
+      # gh-pages ref cr builds its index worktree from (cr never fetches it).
+      # Any other failure (packaging, upload) has no uploaded release for every
+      # package, so the step refuses and the job goes red.
+      - name: Retry the index push
+        if: ${{ !cancelled() && steps.cr.outcome == 'failure' }}
+        shell: bash
+        env:
+          CR_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pkgs=(.cr-release-packages/*.tgz)
+          if (( ${#pkgs[@]} == 0 )); then
+            echo "::error::chart-releaser failed before packaging; nothing to index. See the step above."
+            exit 1
+          fi
+          for pkg in "${pkgs[@]}"; do
+            release=$(basename "$pkg" .tgz)
+            if ! gh release view "$release" --repo "$GITHUB_REPOSITORY" --json assets \
+                --jq '.assets[].name' 2>/dev/null | grep -qxF "${release}.tgz"; then
+              echo "::error::release ${release} has no uploaded ${release}.tgz, so chart-releaser failed before the index push; fix the cause and rerun."
+              exit 1
+            fi
+          done
+          for attempt in 1 2 3; do
+            sleep $((attempt * 15))
+            git fetch origin '+gh-pages:refs/remotes/origin/gh-pages' ||
+              echo "gh-pages not fetched (a first release creates it)."
+            if cr index --owner "${GITHUB_REPOSITORY%%/*}" --git-repo "${GITHUB_REPOSITORY#*/}" --push; then
+              echo "Index pushed on retry ${attempt}."
+              exit 0
+            fi
+            echo "::warning::index push retry ${attempt} failed."
+          done
+          echo "::error::the gh-pages index push failed 3 more times; rerun this job."
+          exit 1

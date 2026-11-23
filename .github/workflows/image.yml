@@ -8,6 +8,13 @@ name: image (reusable)
 #            part of this round.
 #   public:  ghcr.io/teknoir/<image>, from refs/heads/main or a refs/tags/v*
 #            tag that is on origin/main; a tag also pushes :<tag name>.
+# A version-file adds an immutable :<version> tag (never overwritten). It is
+# added after the build by the separate version-tag job, from the tag this run
+# pushed (sha-<8>, or the tag name on a tag build with tag-build-args).
+# build-args may be templated with {sha8}, {sha7}, {sha}, {ref}, {version};
+# tag-build-args overrides them on a tag build, and such a build pushes only
+# :<tag name> (never sha-<8>), so the branch artifact stays immutable while the
+# released binary carries the tag's build args.
 # Never pushes latest or a branch-name tag. Runs on teknoir-push for private
 # repos (its pod carries BUILDKIT_HOST and the Harbor push robot).
 
@@ -35,7 +42,25 @@ on:
         type: string
         default: ''
       build-args:
-        description: Build args, one KEY=VALUE per line.
+        description: >-
+          Build args, one KEY=VALUE per line. Values may use {sha8}, {sha7},
+          {sha}, {ref} (branch or tag name, / replaced by -) and {version}
+          (needs version-file); unknown {placeholders} fail the job.
+        type: string
+        default: ''
+      tag-build-args:
+        description: >-
+          Build args merged over build-args on a refs/tags/* build, same
+          KEY=VALUE and placeholder format. On a key collision the
+          tag-build-args value wins.
+        type: string
+        default: ''
+      version-file:
+        description: >-
+          File holding a version, e.g. 1.2.3. When set, {version} expands to
+          it and the image is also tagged :<version> in every destination,
+          unless that tag already exists (versions are immutable). Characters
+          outside [A-Za-z0-9_.-] become '-' in the tag (vpro's safe_tag).
         type: string
         default: ''
       pre-build:
@@ -72,7 +97,9 @@ on:
         description: Digest of the pushed image.
         value: ${{ jobs.image.outputs.digest }}
       tag:
-        description: Tag of the pushed image (sha-<8>).
+        description: >-
+          Tag of the pushed image: sha-<8>, or the tag name on a tag build with
+          tag-build-args (which pushes no sha-<8>).
         value: ${{ jobs.image.outputs.tag }}
 
 permissions: {}
@@ -88,6 +115,9 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest || steps.exists.outputs.digest }}
       tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.args.outputs.version }}
+      version_tag: ${{ steps.args.outputs.version_tag }}
+      destinations: ${{ steps.meta.outputs.destinations }}
     steps:
       # No credentials on disk: the one fetch that needs them runs below in
       # the public tag branch, where the repository is public.
@@ -133,22 +163,121 @@ jobs:
             exit 1
           fi
 
+      # The build pushes the sha-<8> tag only (plus the ref's own tag on a
+      # public v* build). The version tag is not in this list: the version-tag
+      # job adds it afterwards, from this commit's sha tag.
+      #
+      # A tag build whose tag-build-args is non-empty is the exception: it
+      # pushes only <dest>:<tag name> and never sha-<8>, so the branch's sha-<8>
+      # artifact stays immutable (vpro's keep_ref) while the tag's own build
+      # args reach the released binary. Its `tag` output is the tag name.
       - name: Compute tags and source date
         id: meta
         shell: bash
         env:
           VISIBILITY: ${{ inputs.visibility }}
           IMAGE: ${{ inputs.image }}
+          TAG_BUILD_ARGS: ${{ inputs.tag-build-args }}
         run: |
           set -euo pipefail
+          # BEGIN image-lib - must stay identical to scripts/image-lib.sh
+          image_version_valid() {
+            local version=$1
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+          }
+
+          # image_safe_tag VALUE -> VALUE as a docker tag: every character outside
+          # [A-Za-z0-9_.-] becomes '-', and the result is capped at 128 characters
+          # (vpro's safe_tag, charts/ci/files/plan.py). {version} in build-args keeps
+          # the raw value; only the image tag is mapped.
+          image_safe_tag() {
+            local tag=$1
+            tag=$(printf '%s' "$tag" | sed 's/[^A-Za-z0-9_.-]/-/g')
+            printf '%s' "${tag:0:128}"
+          }
+
+          # image_expand VALUE SHA REF VERSION -> VALUE with the placeholders
+          # replaced. Known placeholders only; unknown ones are left for
+          # image_unknown_placeholders to find.
+          image_expand() {
+            local value=$1 sha=$2 ref=$3 version=$4
+            value=${value//\{sha\}/$sha}
+            value=${value//\{sha8\}/${sha:0:8}}
+            value=${value//\{sha7\}/${sha:0:7}}
+            value=${value//\{version\}/$version}
+            value=${value//\{ref\}/$ref}
+            printf '%s' "$value"
+          }
+
+          # image_unknown_placeholders VALUE -> the {placeholder} names left in
+          # VALUE, one per line, sorted and deduplicated (empty: none).
+          image_unknown_placeholders() {
+            local value=$1 found
+            found=$(printf '%s' "$value" | grep -o '{[A-Za-z0-9_.-]*}' | tr -d '{}' | sort -u) || true
+            printf '%s' "$found"
+          }
+
+          # image_tag_state REF -> 'present' or 'absent' on stdout; 'unverifiable:
+          # <stderr>' and exit 2 when the registry answered with anything but a positive
+          # not-found (429, 5xx, auth, timeout, invalid reference). Only a not-found is
+          # an answer that a tag is missing, so callers can fail closed on the rest.
+          image_tag_state() {
+            local ref=$1 out
+            if out=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              printf 'present'
+              return 0
+            fi
+            if grep -qiE 'not found|manifest unknown|manifest_unknown' <<<"$out"; then
+              printf 'absent'
+              return 0
+            fi
+            printf 'unverifiable: %s' "$out"
+            return 2
+          }
+
+          # image_output_list NAME ITEM... -> append NAME to $GITHUB_OUTPUT as a heredoc,
+          # one item per line. The delimiter carries $RANDOM, so no value (an input can
+          # hold anything) can match it, and printf ends every line, so the last item
+          # cannot run into the delimiter.
+          image_output_list() {
+            local name=$1 delim
+            shift
+            delim="EOF_${RANDOM}_${RANDOM}_${RANDOM}_$$"
+            {
+              printf '%s<<%s\n' "$name" "$delim"
+              if (($# > 0)); then
+                printf '%s\n' "$@"
+              fi
+              printf '%s\n' "$delim"
+            } >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT is not set}"
+          }
+          # END image-lib
+
           tag="sha-${GITHUB_SHA::8}"
+          ref_tag=""
+          tag_build_args=false
+          if [[ "${GITHUB_REF}" == refs/tags/* && -n "${TAG_BUILD_ARGS:-}" ]]; then
+            tag_build_args=true
+            ref_tag="${GITHUB_REF#refs/tags/}"
+            if [[ "$ref_tag" == latest ]]; then
+              echo "::error::refusing to push latest."
+              exit 1
+            fi
+            # This run pushes the tag, not sha-<8>; the version-tag job tags
+            # :<version> from it.
+            tag="$ref_tag"
+          fi
           epoch=$(git log -1 --format=%ct)
+          if [[ -z "$IMAGE" ]] || [[ ! "$IMAGE" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]; then
+            echo "::error::image '${IMAGE}' is not a valid repository name (lowercase, without registry or tag, e.g. backstage or toe-app)."
+            exit 1
+          fi
           if [[ "$tag" == latest ]]; then
             echo "::error::refusing to build the tag latest."
             exit 1
           fi
-          tags=""
           dests=()
+          tags=()
           if [[ "$VISIBILITY" == private ]]; then
             dests+=("harbor.teknoir.cloud/teknoir/${IMAGE}")
             dests+=("ghcr.io/teknoir/${IMAGE}")
@@ -159,17 +288,22 @@ jobs:
             exit 1
           fi
           for dest in "${dests[@]}"; do
-            [[ "$tag" == latest ]] && { echo "::error::refusing to push latest."; exit 1; }
-            tags+="${dest}:${tag}"$'\n'
-            # Private builds push sha-<8> only: a release re-tags the digest
-            # built on main later (docker buildx imagetools create).
+            if [[ "$tag_build_args" == true ]]; then
+              # The tag only: sha-<8> belongs to the branch build, which baked
+              # the branch's build args.
+              tags+=("${dest}:${ref_tag}")
+              continue
+            fi
+            tags+=("${dest}:${tag}")
+            # Private builds push sha-<8> only. A public v* build also pushes
+            # the tag name: the caller asked for that ref to be published.
             if [[ "$VISIBILITY" == public && "${GITHUB_REF}" == refs/tags/v* ]]; then
               ref_tag="${GITHUB_REF#refs/tags/}"
               if [[ "$ref_tag" == latest ]]; then
                 echo "::error::refusing to push latest."
                 exit 1
               fi
-              tags+="${dest}:${ref_tag}"$'\n'
+              tags+=("${dest}:${ref_tag}")
             fi
           done
           {
@@ -177,11 +311,192 @@ jobs:
             echo "first_destination=${dests[0]}"
             echo "visibility=${VISIBILITY}"
             echo "source_date_epoch=${epoch}"
-            echo "tags<<EOF"
-            printf '%s' "$tags"
-            echo "EOF"
           } >> "$GITHUB_OUTPUT"
+          image_output_list destinations "${dests[@]}"
+          image_output_list tags "${tags[@]}"
           echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
+
+      # build-args values are templated ({sha8}, {sha7}, {sha}, {ref},
+      # {version}); the expansion runs here, in bash, and the result goes to
+      # the build, never back through ${{ }} interpolation. tag-build-args is
+      # merged over build-args on a tag build (vpro's tagBuildArgs).
+      - name: Read version-file and expand build-args
+        id: args
+        shell: bash
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+          TAG_BUILD_ARGS: ${{ inputs.tag-build-args }}
+          VERSION_FILE: ${{ inputs.version-file }}
+        run: |
+          set -euo pipefail
+          # BEGIN image-lib - must stay identical to scripts/image-lib.sh
+          image_version_valid() {
+            local version=$1
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+          }
+
+          # image_safe_tag VALUE -> VALUE as a docker tag: every character outside
+          # [A-Za-z0-9_.-] becomes '-', and the result is capped at 128 characters
+          # (vpro's safe_tag, charts/ci/files/plan.py). {version} in build-args keeps
+          # the raw value; only the image tag is mapped.
+          image_safe_tag() {
+            local tag=$1
+            tag=$(printf '%s' "$tag" | sed 's/[^A-Za-z0-9_.-]/-/g')
+            printf '%s' "${tag:0:128}"
+          }
+
+          # image_expand VALUE SHA REF VERSION -> VALUE with the placeholders
+          # replaced. Known placeholders only; unknown ones are left for
+          # image_unknown_placeholders to find.
+          image_expand() {
+            local value=$1 sha=$2 ref=$3 version=$4
+            value=${value//\{sha\}/$sha}
+            value=${value//\{sha8\}/${sha:0:8}}
+            value=${value//\{sha7\}/${sha:0:7}}
+            value=${value//\{version\}/$version}
+            value=${value//\{ref\}/$ref}
+            printf '%s' "$value"
+          }
+
+          # image_unknown_placeholders VALUE -> the {placeholder} names left in
+          # VALUE, one per line, sorted and deduplicated (empty: none).
+          image_unknown_placeholders() {
+            local value=$1 found
+            found=$(printf '%s' "$value" | grep -o '{[A-Za-z0-9_.-]*}' | tr -d '{}' | sort -u) || true
+            printf '%s' "$found"
+          }
+
+          # image_tag_state REF -> 'present' or 'absent' on stdout; 'unverifiable:
+          # <stderr>' and exit 2 when the registry answered with anything but a positive
+          # not-found (429, 5xx, auth, timeout, invalid reference). Only a not-found is
+          # an answer that a tag is missing, so callers can fail closed on the rest.
+          image_tag_state() {
+            local ref=$1 out
+            if out=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              printf 'present'
+              return 0
+            fi
+            if grep -qiE 'not found|manifest unknown|manifest_unknown' <<<"$out"; then
+              printf 'absent'
+              return 0
+            fi
+            printf 'unverifiable: %s' "$out"
+            return 2
+          }
+
+          # image_output_list NAME ITEM... -> append NAME to $GITHUB_OUTPUT as a heredoc,
+          # one item per line. The delimiter carries $RANDOM, so no value (an input can
+          # hold anything) can match it, and printf ends every line, so the last item
+          # cannot run into the delimiter.
+          image_output_list() {
+            local name=$1 delim
+            shift
+            delim="EOF_${RANDOM}_${RANDOM}_${RANDOM}_$$"
+            {
+              printf '%s<<%s\n' "$name" "$delim"
+              if (($# > 0)); then
+                printf '%s\n' "$@"
+              fi
+              printf '%s\n' "$delim"
+            } >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT is not set}"
+          }
+          # END image-lib
+
+          version=""
+          if [[ -n "$VERSION_FILE" ]]; then
+            if [[ ! -f "$VERSION_FILE" ]]; then
+              echo "::error::version-file '${VERSION_FILE}' does not exist."
+              exit 1
+            fi
+            version=$(tr -d '[:space:]' < "$VERSION_FILE")
+            if ! image_version_valid "$version"; then
+              echo "::error::version-file '${VERSION_FILE}' must hold a version like 1.2.3 or 1.2.3-rc.1, not '${version}'."
+              exit 1
+            fi
+          fi
+          on_tag=false
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            on_tag=true
+          fi
+          ref="${GITHUB_REF_NAME//\//-}"
+          UNKNOWN=""
+          EXPANDED=()
+
+          # expand_list LABEL TEXT -> each KEY=VALUE line expanded into
+          # EXPANDED; an unknown placeholder is recorded in UNKNOWN.
+          expand_list() {
+            local label=$1 text=$2 line out missing name
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              line="${line%$'\r'}"
+              [[ -z "$line" ]] && continue
+              if [[ "$line" != *=* ]]; then
+                echo "::error::${label} line '${line}' is not KEY=VALUE."
+                return 1
+              fi
+              if [[ -z "$version" && "$line" == *'{version}'* ]]; then
+                echo "::error::${label} uses {version} but version-file is not set."
+                return 1
+              fi
+              out=$(image_expand "$line" "$GITHUB_SHA" "$ref" "$version")
+              missing=$(image_unknown_placeholders "$out")
+              while IFS= read -r name; do
+                if [[ -n "$name" ]]; then
+                  UNKNOWN+="{${name}} (${label}) "
+                fi
+              done <<< "$missing"
+              EXPANDED+=("$out")
+            done <<< "$text"
+          }
+
+          expand_list build-args "$BUILD_ARGS"
+          base_lines=("${EXPANDED[@]}")
+          merged=("${base_lines[@]}")
+          if [[ "$on_tag" == true ]]; then
+            EXPANDED=()
+            expand_list tag-build-args "$TAG_BUILD_ARGS"
+            tag_lines=("${EXPANDED[@]}")
+            # A tag-build-args key replaces the build-args line with the same
+            # key and keeps its position; a new key is appended.
+            if ((${#tag_lines[@]} > 0)); then
+              declare -A tag_arg=()
+              for line in "${tag_lines[@]}"; do
+                tag_arg["${line%%=*}"]=$line
+              done
+              merged=()
+              for line in "${base_lines[@]}"; do
+                line_key="${line%%=*}"
+                if [[ -n "${tag_arg[$line_key]:-}" ]]; then
+                  merged+=("${tag_arg[$line_key]}")
+                  unset 'tag_arg[$line_key]'
+                else
+                  merged+=("$line")
+                fi
+              done
+              for line_key in "${!tag_arg[@]}"; do
+                merged+=("${tag_arg[$line_key]}")
+              done
+            fi
+          fi
+          if [[ -n "$UNKNOWN" ]]; then
+            echo "::error::unknown build-args placeholders: ${UNKNOWN% }"
+            exit 1
+          fi
+          version_tag=""
+          if [[ -n "$version" ]]; then
+            version_tag=$(image_safe_tag "$version")
+          fi
+          {
+            echo "version=${version}"
+            echo "version_tag=${version_tag}"
+          } >> "$GITHUB_OUTPUT"
+          image_output_list build_args "${merged[@]}"
+          if [[ -n "$version" ]]; then
+            if [[ "$version_tag" != "$version" ]]; then
+              echo "Version ${version} from ${VERSION_FILE}; image tag ${version_tag}."
+            else
+              echo "Version ${version} from ${VERSION_FILE}."
+            fi
+          fi
 
       - name: Bridge the remote BuildKit endpoint
         if: inputs.visibility == 'private'
@@ -231,8 +546,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      # The sha tag is the only thing ever built; the other tags in the list
-      # (a public v* tag) are created from it when it is already there.
+      # The sha tag is the only thing ever built; the other tag in the list
+      # (a public v* tag) is created from it when it is already there. A
+      # version tag is not in this list at all: the version-tag job adds it.
+      #
+      # A tag build with tag-build-args never pushes sha-<8>; its tag list is
+      # the tags themselves. None there: build. All there: skip. Some there:
+      # fail closed, so one release is never split across destinations.
       - name: Skip if the image already exists
         id: exists
         shell: bash
@@ -240,30 +560,155 @@ jobs:
           FIRST_DESTINATION: ${{ steps.meta.outputs.first_destination }}
           TAG: ${{ steps.meta.outputs.tag }}
           TAGS: ${{ steps.meta.outputs.tags }}
+          TAG_BUILD_ARGS: ${{ inputs.tag-build-args }}
         run: |
           set -euo pipefail
-          sha_ref="${FIRST_DESTINATION}:${TAG}"
-          if ! docker buildx imagetools inspect "$sha_ref" >/dev/null 2>&1; then
+          # BEGIN image-lib - must stay identical to scripts/image-lib.sh
+          image_version_valid() {
+            local version=$1
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+          }
+
+          # image_safe_tag VALUE -> VALUE as a docker tag: every character outside
+          # [A-Za-z0-9_.-] becomes '-', and the result is capped at 128 characters
+          # (vpro's safe_tag, charts/ci/files/plan.py). {version} in build-args keeps
+          # the raw value; only the image tag is mapped.
+          image_safe_tag() {
+            local tag=$1
+            tag=$(printf '%s' "$tag" | sed 's/[^A-Za-z0-9_.-]/-/g')
+            printf '%s' "${tag:0:128}"
+          }
+
+          # image_expand VALUE SHA REF VERSION -> VALUE with the placeholders
+          # replaced. Known placeholders only; unknown ones are left for
+          # image_unknown_placeholders to find.
+          image_expand() {
+            local value=$1 sha=$2 ref=$3 version=$4
+            value=${value//\{sha\}/$sha}
+            value=${value//\{sha8\}/${sha:0:8}}
+            value=${value//\{sha7\}/${sha:0:7}}
+            value=${value//\{version\}/$version}
+            value=${value//\{ref\}/$ref}
+            printf '%s' "$value"
+          }
+
+          # image_unknown_placeholders VALUE -> the {placeholder} names left in
+          # VALUE, one per line, sorted and deduplicated (empty: none).
+          image_unknown_placeholders() {
+            local value=$1 found
+            found=$(printf '%s' "$value" | grep -o '{[A-Za-z0-9_.-]*}' | tr -d '{}' | sort -u) || true
+            printf '%s' "$found"
+          }
+
+          # image_tag_state REF -> 'present' or 'absent' on stdout; 'unverifiable:
+          # <stderr>' and exit 2 when the registry answered with anything but a positive
+          # not-found (429, 5xx, auth, timeout, invalid reference). Only a not-found is
+          # an answer that a tag is missing, so callers can fail closed on the rest.
+          image_tag_state() {
+            local ref=$1 out
+            if out=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              printf 'present'
+              return 0
+            fi
+            if grep -qiE 'not found|manifest unknown|manifest_unknown' <<<"$out"; then
+              printf 'absent'
+              return 0
+            fi
+            printf 'unverifiable: %s' "$out"
+            return 2
+          }
+
+          # image_output_list NAME ITEM... -> append NAME to $GITHUB_OUTPUT as a heredoc,
+          # one item per line. The delimiter carries $RANDOM, so no value (an input can
+          # hold anything) can match it, and printf ends every line, so the last item
+          # cannot run into the delimiter.
+          image_output_list() {
+            local name=$1 delim
+            shift
+            delim="EOF_${RANDOM}_${RANDOM}_${RANDOM}_$$"
+            {
+              printf '%s<<%s\n' "$name" "$delim"
+              if (($# > 0)); then
+                printf '%s\n' "$@"
+              fi
+              printf '%s\n' "$delim"
+            } >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT is not set}"
+          }
+          # END image-lib
+
+          # STATE is set by state_of; a registry error is fatal, never 'absent'.
+          STATE=""
+          state_of() {
+            local ref=$1 out
+            if ! out=$(image_tag_state "$ref"); then
+              echo "::error::cannot verify ${ref} (registry error, not a missing tag): ${out}"
+              return 1
+            fi
+            STATE=$out
+          }
+
+          if [[ "${GITHUB_REF:-}" == refs/tags/* && -n "${TAG_BUILD_ARGS:-}" ]]; then
+            # The build would push these tags only, with the tag's own build
+            # args. An existing tag is never overwritten: if any is there, the
+            # build cannot produce the rest without splitting the release.
+            present=0
+            absent=0
+            present_ref=""
+            while IFS= read -r ref; do
+              [[ -n "$ref" ]] || continue
+              state_of "$ref"
+              if [[ "$STATE" == present ]]; then
+                present=$((present + 1))
+                present_ref=$ref
+              else
+                absent=$((absent + 1))
+              fi
+            done <<< "$TAGS"
+            if [[ "$absent" -eq 0 ]]; then
+              digest=$(docker buildx imagetools inspect "$present_ref" \
+                --format '{{json .Manifest}}' | jq -r '.digest // empty')
+              if [[ -z "$digest" ]]; then
+                echo "::error::could not read the digest of ${present_ref}."
+                exit 1
+              fi
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+              echo "Every tag of this build already exists; skipping the build."
+              exit 0
+            fi
+            if [[ "$present" -gt 0 ]]; then
+              echo "::error::${present} of this tag build's tags already exist and ${absent} do not (${present_ref} is present); building would push only some of them and leave one release split across destinations. Delete the existing tag(s) or bump the tag."
+              exit 1
+            fi
             echo "exists=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          sha_ref="${FIRST_DESTINATION}:${TAG}"
+          state_of "$sha_ref"
+          if [[ "$STATE" == absent ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          digest=$(docker buildx imagetools inspect "$sha_ref" \
+            --format '{{json .Manifest}}' | jq -r '.digest // empty')
+          if [[ -z "$digest" ]]; then
+            echo "::error::could not read the digest of ${sha_ref}."
+            exit 1
+          fi
           while IFS= read -r ref; do
             [[ -n "$ref" && "$ref" != "$sha_ref" ]] || continue
-            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            state_of "$ref"
+            if [[ "$STATE" == present ]]; then
               continue
             fi
-            docker buildx imagetools create -t "$ref" "$sha_ref"
+            # --prefer-index=false: a carbon copy, so every tag of one build has the same digest
+            # (by default a single-platform manifest would be wrapped in a new index).
+            docker buildx imagetools create --prefer-index=false -t "$ref" "$sha_ref"
             echo "Created ${ref} from ${sha_ref}."
           done <<< "$TAGS"
           echo "exists=true" >> "$GITHUB_OUTPUT"
           # A skipped build still publishes a digest for the caller.
-          digest=$(docker buildx imagetools inspect "$sha_ref" \
-            --format '{{json .Manifest}}' | jq -r .digest)
-          if [[ -n "$digest" && "$digest" != null ]]; then
-            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::Could not read the digest of ${sha_ref}."
-          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "${sha_ref} already exists; skipping the build."
 
       - name: Create empty placeholder files
@@ -305,7 +750,7 @@ jobs:
           file: ${{ inputs.file }}
           platforms: ${{ inputs.platforms }}
           target: ${{ inputs.target }}
-          build-args: ${{ inputs.build-args }}
+          build-args: ${{ steps.args.outputs.build_args }}
           tags: ${{ steps.meta.outputs.tags }}
           outputs: type=registry,rewrite-timestamp=true
           provenance: false
@@ -320,6 +765,8 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest || steps.exists.outputs.digest }}
           EXISTS: ${{ steps.exists.outputs.exists }}
           FIRST_DESTINATION: ${{ steps.meta.outputs.first_destination }}
+          VERSION: ${{ steps.args.outputs.version }}
+          VERSION_TAG: ${{ steps.args.outputs.version_tag }}
           BUILD_RESULT: ${{ steps.build.outcome }}
         run: |
           set -euo pipefail
@@ -339,4 +786,289 @@ jobs:
             else
               echo "Build did not succeed (${BUILD_RESULT:-skipped})."
             fi
+            if [[ -n "${VERSION}" ]]; then
+              echo
+              echo "Version: \`${VERSION}\` (the version-tag job adds \`${VERSION_TAG}\` where it is missing)."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Adds :<version> to every destination. A version tag names an immutable
+  # release: it is created only where the registry positively reports it
+  # missing. Where no destination has it yet, each is tagged from the tag this
+  # run pushed; where some destination has it, the others are created from that
+  # digest, and destinations that disagree on the digest fail the job. Runs
+  # after a successful build or skip, and only for a version-file.
+  version-tag:
+    name: version-tag
+    needs: image
+    if: inputs.version-file != ''
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    # One run per image and version at a time: two commits carrying the same
+    # version must not both create <dest>:<version>. GitHub keeps one pending
+    # job per group, so a newer run for the same version can replace a pending
+    # one; it checks the same tag and creates it only where it is still absent.
+    # Runs for different versions are in different groups and never replace
+    # each other.
+    concurrency:
+      group: ci-workflows-image-version-${{ github.repository }}-${{ inputs.image }}-${{ needs.image.outputs.version_tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Bridge the remote BuildKit endpoint
+        if: inputs.visibility == 'private'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${BUILDKIT_HOST:-}" ]]; then
+            echo "::error::BUILDKIT_HOST is empty. Private image builds run on teknoir-push, whose pod sets BUILDKIT_HOST=tcp://buildkitd.buildkit.svc.cluster.local:1234."
+            exit 1
+          fi
+          echo "BUILDKIT_HOST=${BUILDKIT_HOST}" >> "$GITHUB_ENV"
+
+      - name: Set up buildx (private, remote BuildKit)
+        if: inputs.visibility == 'private'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: remote
+          endpoint: ${{ env.BUILDKIT_HOST }}
+
+      - name: Set up buildx (public)
+        if: inputs.visibility == 'public'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The teknoir-push pod exports the Harbor push robot; read it directly
+      # here and keep it out of GITHUB_ENV, GITHUB_OUTPUT, `with:` and `env:`.
+      - name: Log in to Harbor
+        if: inputs.visibility == 'private'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${HARBOR_USERNAME:-}" || -z "${HARBOR_PASSWORD:-}" ]]; then
+            echo '::error::teknoir-push pod has no Harbor credential'
+            exit 1
+          fi
+          echo "::add-mask::${HARBOR_PASSWORD}"
+          printf '%s' "$HARBOR_PASSWORD" |
+            docker login harbor.teknoir.cloud -u "$HARBOR_USERNAME" --password-stdin
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Add the version tag
+        shell: bash
+        env:
+          VERSION: ${{ needs.image.outputs.version }}
+          VERSION_TAG: ${{ needs.image.outputs.version_tag }}
+          TAG: ${{ needs.image.outputs.tag }}
+          DESTINATIONS: ${{ needs.image.outputs.destinations }}
+        run: |
+          set -euo pipefail
+          # BEGIN image-lib - must stay identical to scripts/image-lib.sh
+          image_version_valid() {
+            local version=$1
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+          }
+
+          # image_safe_tag VALUE -> VALUE as a docker tag: every character outside
+          # [A-Za-z0-9_.-] becomes '-', and the result is capped at 128 characters
+          # (vpro's safe_tag, charts/ci/files/plan.py). {version} in build-args keeps
+          # the raw value; only the image tag is mapped.
+          image_safe_tag() {
+            local tag=$1
+            tag=$(printf '%s' "$tag" | sed 's/[^A-Za-z0-9_.-]/-/g')
+            printf '%s' "${tag:0:128}"
+          }
+
+          # image_expand VALUE SHA REF VERSION -> VALUE with the placeholders
+          # replaced. Known placeholders only; unknown ones are left for
+          # image_unknown_placeholders to find.
+          image_expand() {
+            local value=$1 sha=$2 ref=$3 version=$4
+            value=${value//\{sha\}/$sha}
+            value=${value//\{sha8\}/${sha:0:8}}
+            value=${value//\{sha7\}/${sha:0:7}}
+            value=${value//\{version\}/$version}
+            value=${value//\{ref\}/$ref}
+            printf '%s' "$value"
+          }
+
+          # image_unknown_placeholders VALUE -> the {placeholder} names left in
+          # VALUE, one per line, sorted and deduplicated (empty: none).
+          image_unknown_placeholders() {
+            local value=$1 found
+            found=$(printf '%s' "$value" | grep -o '{[A-Za-z0-9_.-]*}' | tr -d '{}' | sort -u) || true
+            printf '%s' "$found"
+          }
+
+          # image_tag_state REF -> 'present' or 'absent' on stdout; 'unverifiable:
+          # <stderr>' and exit 2 when the registry answered with anything but a positive
+          # not-found (429, 5xx, auth, timeout, invalid reference). Only a not-found is
+          # an answer that a tag is missing, so callers can fail closed on the rest.
+          image_tag_state() {
+            local ref=$1 out
+            if out=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              printf 'present'
+              return 0
+            fi
+            if grep -qiE 'not found|manifest unknown|manifest_unknown' <<<"$out"; then
+              printf 'absent'
+              return 0
+            fi
+            printf 'unverifiable: %s' "$out"
+            return 2
+          }
+
+          # image_output_list NAME ITEM... -> append NAME to $GITHUB_OUTPUT as a heredoc,
+          # one item per line. The delimiter carries $RANDOM, so no value (an input can
+          # hold anything) can match it, and printf ends every line, so the last item
+          # cannot run into the delimiter.
+          image_output_list() {
+            local name=$1 delim
+            shift
+            delim="EOF_${RANDOM}_${RANDOM}_${RANDOM}_$$"
+            {
+              printf '%s<<%s\n' "$name" "$delim"
+              if (($# > 0)); then
+                printf '%s\n' "$@"
+              fi
+              printf '%s\n' "$delim"
+            } >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT is not set}"
+          }
+          # END image-lib
+
+          if [[ -z "$VERSION" || -z "$VERSION_TAG" ]]; then
+            echo "::error::version-file is set, but the image job reported no version ('${VERSION}' / '${VERSION_TAG}')."
+            exit 1
+          fi
+          if [[ -z "$TAG" || -z "$DESTINATIONS" ]]; then
+            echo "::error::the image job reported no sha tag or destinations."
+            exit 1
+          fi
+
+          # STATE is set by state_of; a registry error is fatal, never 'absent'.
+          STATE=""
+          state_of() {
+            local ref=$1 out
+            if ! out=$(image_tag_state "$ref"); then
+              echo "::error::cannot verify ${ref} (registry error, not a missing tag): ${out}"
+              return 1
+            fi
+            STATE=$out
+          }
+
+          digest_of() {
+            local ref=$1 d
+            d=$(docker buildx imagetools inspect "$ref" \
+              --format '{{json .Manifest}}' | jq -r '.digest // empty')
+            [[ -n "$d" ]] || return 1
+            printf '%s' "$d"
+          }
+
+          # Pass 1: read every destination's state and, where the version tag
+          # exists, its digest. A registry error aborts here, before any tag is
+          # written.
+          dests=()
+          states=()
+          sha_states=()
+          version_digests=()
+          while IFS= read -r dest; do
+            [[ -n "$dest" ]] || continue
+            dests+=("$dest")
+            state_of "${dest}:${VERSION_TAG}"
+            states+=("$STATE")
+            if [[ "$STATE" == present ]]; then
+              version_digests+=("$(digest_of "${dest}:${VERSION_TAG}")") || {
+                echo "::error::could not read the digest of ${dest}:${VERSION_TAG}."
+                exit 1
+              }
+            else
+              version_digests+=("")
+            fi
+            state_of "${dest}:${TAG}"
+            sha_states+=("$STATE")
+          done <<< "$DESTINATIONS"
+          if ((${#dests[@]} == 0)); then
+            echo "::error::no destinations reported by the image job."
+            exit 1
+          fi
+
+          # A version names one release, so every destination that has it must
+          # agree on its digest. Disagreement is fatal and writes nothing: the
+          # destinations already serve different content for the same version,
+          # and tagging the rest from either would make it worse.
+          canonical=""
+          canonical_dest=""
+          for i in "${!dests[@]}"; do
+            [[ "${states[$i]}" == present ]] || continue
+            version_digest="${version_digests[$i]}"
+            if [[ -z "$canonical" ]]; then
+              canonical="$version_digest"
+              canonical_dest="${dests[$i]}"
+            elif [[ "$version_digest" != "$canonical" ]]; then
+              echo "::error::${canonical_dest}:${VERSION_TAG} is ${canonical} but ${dests[$i]}:${VERSION_TAG} is ${version_digest}; the destinations disagree on ${VERSION_TAG}, so nothing is written."
+              exit 1
+            fi
+          done
+
+          created=0
+          present=0
+          if [[ -z "$canonical" ]]; then
+            # No destination has this version yet: each is tagged from its own
+            # sha-<8> tag, pushed by the image job.
+            for i in "${!dests[@]}"; do
+              dest="${dests[$i]}"
+              sha_ref="${dest}:${TAG}"
+              if [[ "${sha_states[$i]}" != present ]]; then
+                echo "::error::${sha_ref} does not exist, so ${dest}:${VERSION_TAG} cannot be tagged from it."
+                exit 1
+              fi
+              # --prefer-index=false: the same digest as sha-<8>, not a new index around it.
+              docker buildx imagetools create --prefer-index=false -t "${dest}:${VERSION_TAG}" "$sha_ref"
+              echo "Created ${dest}:${VERSION_TAG} from ${sha_ref}."
+              created=$((created + 1))
+            done
+            echo "Version ${VERSION} as ${VERSION_TAG}: ${created} created, ${present} already present."
+            exit 0
+          fi
+
+          # Some destination has the version: its digest is the release's
+          # content. Missing destinations are created from that digest (not
+          # from this commit, which may carry the same version on other code),
+          # and the present ones are left untouched.
+          this_commit=false
+          this_digest=""
+          for i in "${!dests[@]}"; do
+            [[ "${sha_states[$i]}" == present ]] || continue
+            this_digest=$(digest_of "${dests[$i]}:${TAG}") || {
+              echo "::error::could not read the digest of ${dests[$i]}:${TAG}."
+              exit 1
+            }
+            if [[ "$this_digest" == "$canonical" ]]; then
+              this_commit=true
+              break
+            fi
+          done
+          if [[ "$this_commit" == true ]]; then
+            echo "The present ${VERSION_TAG} tags already point at this commit's digest."
+          else
+            echo "::warning::${canonical_dest}:${VERSION_TAG} already exists with digest ${canonical}, which is not this commit's digest (${this_digest:-no ${TAG} tag anywhere}); versions are immutable, so it is left as it is and the missing destinations are created from it."
+          fi
+          for i in "${!dests[@]}"; do
+            version_ref="${dests[$i]}:${VERSION_TAG}"
+            if [[ "${states[$i]}" == present ]]; then
+              echo "${version_ref} already exists with digest ${canonical}; nothing to do."
+              present=$((present + 1))
+              continue
+            fi
+            docker buildx imagetools create -t "$version_ref" "${canonical_dest}@${canonical}"
+            echo "Created ${version_ref} from ${canonical_dest}@${canonical}."
+            created=$((created + 1))
+          done
+          echo "Version ${VERSION} as ${VERSION_TAG}: ${created} created, ${present} already present."

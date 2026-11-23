@@ -1,0 +1,27 @@
+name: chart-release
+
+# Chart repo: main releases whatever versions its charts carry (vpro did not
+# insist on X.Y.Z there), the beta branch releases prereleases (Chart.yaml
+# version X.Y.Z-something, never marked latest). A published chart version is
+# never changed: bump the version to release.
+
+on:
+  push:
+    branches: [main, beta]
+  workflow_dispatch:
+
+concurrency:
+  group: chart-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  chart-release:
+    uses: teknoir/ci-workflows/.github/workflows/chart-release.yml@main
+    with:
+      charts-dir: charts
+      release-branch: main
+      prerelease-branch: beta
+    permissions:
+      contents: write
