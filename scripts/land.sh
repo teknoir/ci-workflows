@@ -143,6 +143,16 @@ dependabot_entry_count() {
 
 # dependabot_zero_version_entries <commit message> - "<name> <version>" for
 # every entry whose dependency-version starts with 0. (a 0.x minor can break).
+# Distinct dependency names in the updated-dependencies block. A group that spans
+# several directories lists the same dependency once per directory, while the
+# title ("... across 3 directories with 7 updates") counts each name once.
+dependabot_unique_name_count() {
+  local n
+  n=$(updated_dependencies_block "$1" |
+    sed -nE 's/^[[:space:]]*-[[:space:]]*dependency-name:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p' |
+    sort -u | grep -c . || true)
+  printf '%s' "${n:-0}"
+}
 dependabot_zero_version_entries() {
   updated_dependencies_block "$1" | awk '
     /^[[:space:]]*-[[:space:]]*dependency-name:[[:space:]]*/ {
@@ -217,7 +227,7 @@ dependabot_commits_allowed() {
   type_count=$(grep -c . <<<"$types" || true)
   (( type_count == entries )) || return 1
   declared=$(dependabot_title_count "$title")
-  if [[ -n $declared ]] && (( declared != entries )); then
+  if [[ -n $declared ]] && (( declared != $(dependabot_unique_name_count "$msg") )); then
     return 1
   fi
   while read -r name _version; do
