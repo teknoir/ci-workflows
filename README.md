@@ -155,7 +155,7 @@ Builds one image and pushes `sha-<8>`:
 `latest` and branch-name tags are refused. The build is skipped when the
 `sha-<8>` tag already exists, and any other tag in the list that is missing is
 then created from it. Inputs: `image` (required), `context`, `file`,
-`platforms` (`linux/amd64`), `target`, `build-args`, `pre-build` (public
+`platforms` (`linux/amd64`), `target`, `build-args`, `empty-files` (empty placeholder files to create, one relative path per line; allowed on private builds), `pre-build` (public
 builds only; a private build with `pre-build` fails in the ref step), `lfs`,
 `visibility` (`private`/`public`), `runs-on` (`teknoir-push`),
 `timeout-minutes` (60).

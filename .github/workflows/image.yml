@@ -44,6 +44,13 @@ on:
           it would run next to the Harbor push credential.
         type: string
         default: ''
+      empty-files:
+        description: >-
+          Empty files to create before the build, one relative path per line
+          (placeholders a Dockerfile COPYs, such as secret files mounted at run
+          time). Runs no repo code, so private builds may use it.
+        type: string
+        default: ''
       lfs:
         description: Check out Git LFS files.
         type: boolean
@@ -258,6 +265,25 @@ jobs:
             echo "::warning::Could not read the digest of ${sha_ref}."
           fi
           echo "${sha_ref} already exists; skipping the build."
+
+      - name: Create empty placeholder files
+        if: inputs.empty-files != '' && steps.exists.outputs.exists == 'false'
+        shell: bash
+        env:
+          EMPTY_FILES: ${{ inputs.empty-files }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r f; do
+            f="${f#"${f%%[![:space:]]*}"}"; f="${f%"${f##*[![:space:]]}"}"
+            [[ -z "$f" ]] && continue
+            case "$f" in
+              /*|..|../*|*/../*|*/..) echo "::error::empty-files: '$f' must be a relative path inside the repo"; exit 1 ;;
+            esac
+            if [[ -e "$f" ]]; then echo "::error::empty-files: '$f' already exists"; exit 1; fi
+            mkdir -p -- "$(dirname -- "$f")"
+            : > "$f"
+            echo "created empty $f"
+          done <<< "$EMPTY_FILES"
 
       # Public builds only: a private build runs every Dockerfile step next to
       # the Harbor push credential, so pre-build is refused there.
