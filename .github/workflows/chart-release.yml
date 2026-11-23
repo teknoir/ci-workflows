@@ -141,11 +141,40 @@ jobs:
           version: ${{ inputs.helm-version }}
 
       - name: Run chart-releaser
+        id: cr
         uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
         with:
           charts_dir: ${{ inputs.charts-dir }}
           skip_existing: true
           # Prerelease versions must never become the chart repo's latest.
+          mark_as_latest: ${{ steps.mode.outputs.mark_as_latest }}
+        env:
+          CR_TOKEN: ${{ github.token }}
+
+      # A run on the other branch can push gh-pages between this run's checkout
+      # and its index push; cr's index `git pull` then aborts and cr upload has
+      # already created the release, so only the index entry is missing. Wait
+      # for the other push to settle, refresh the ref chart-releaser builds its
+      # index worktree from (it never fetches), then run chart-releaser again:
+      # skip_existing skips the existing release, and the index is rebuilt from
+      # the fresh gh-pages index plus this run's charts.
+      - name: Wait, then refresh the gh-pages ref
+        if: failure() && steps.cr.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sleep 30
+          # gh-pages may not exist yet on a first release; the index push
+          # creates it.
+          git fetch origin 'gh-pages:refs/remotes/origin/gh-pages' ||
+            echo "gh-pages not fetched; the retry will retry it from the checkout's ref."
+
+      - name: Retry chart-releaser
+        if: failure() && steps.cr.outcome == 'failure'
+        uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
+        with:
+          charts_dir: ${{ inputs.charts-dir }}
+          skip_existing: true
           mark_as_latest: ${{ steps.mode.outputs.mark_as_latest }}
         env:
           CR_TOKEN: ${{ github.token }}

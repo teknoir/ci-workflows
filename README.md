@@ -155,7 +155,9 @@ Builds one image and pushes `sha-<8>`:
 `latest` and branch-name tags are refused. The build is skipped when the
 `sha-<8>` tag already exists, and any other tag in the list that is missing is
 then created from it (a registry error while checking is an `::error::` and
-fails the job rather than rebuilding). `image` must be a lowercase repository
+fails the job rather than rebuilding). The one exception is a tag build with
+`tag-build-args` set: it pushes no `sha-<8>` and is checked on its tag name
+instead (see `tag-build-args` below). `image` must be a lowercase repository
 name without registry or tag (`backstage`, `toe-app`), since the destinations
 are `<registry>/teknoir/<image>`. Inputs: `image` (required), `context`, `file`,
 `platforms` (`linux/amd64`), `target`, `build-args`, `tag-build-args`,
@@ -166,8 +168,9 @@ builds only; a private build with `pre-build` fails in the ref step), `lfs`,
 `timeout-minutes` (60).
 
 The build and push step pushes only the `sha-<8>` tag (and, on a public `v*`
-build, the tag name). The `version-file` tag is added afterwards, by the
-separate `version-tag` job (below).
+build, the tag name; on a tag build with `tag-build-args`, the tag name only).
+The `version-file` tag is added afterwards, by the separate `version-tag` job
+(below).
 
 **Templated `build-args`.** A `build-args` value may use placeholders, with the
 same `KEY=VALUE` per-line format:
@@ -194,9 +197,26 @@ different version string into the binary (vpro's `tagBuildArgs`). A key in
 both keeps the `tag-build-args` value; a key only in `tag-build-args` is
 appended. On a branch, `tag-build-args` is ignored.
 
+When it is non-empty on a tag, the tag build pushes **only** `<dest>:<tag>`
+and never `sha-<8>` (vpro's `keep_ref`), so the branch artifact stays
+immutable and the tag's build args really reach the released binary. The
+`<dest>:<sha-<8>>` shortcut is not used for such a build: each destination's
+`<dest>:<tag>` is checked with the tri-state helper instead.
+
+| `<dest>:<tag>` on the destinations | Result |
+| --- | --- |
+| absent everywhere | build and push `:<tag>` with the tag's merged args |
+| present in every destination | skip the build (existing content is never overwritten) |
+| present in some, absent in others | `::error::`, job fails; one release is never split across destinations |
+| any read error | `::error::`, fails closed |
+
+The image job's `tag` output is the tag name on such a build, so the
+`version-tag` job tags `:<version>` from `:<tag>`.
+
 ```yaml
-# wg-hub (vpro: repos/wg-tunnel.yaml): the tag build bakes VERSION=v1.2.3,
-# a branch build VERSION=main-abc1234
+# wg-hub (vpro: repos/wg-tunnel.yaml): the tag build bakes VERSION=v1.2.3
+# and pushes only :v1.2.3; a branch build bakes VERSION=main-abc1234 in
+# sha-<8>
     with:
       image: wg-hub
       context: .
@@ -223,19 +243,26 @@ destination separately, and fails closed: a registry answer that is not a
 positive "not found" (`429`, `5xx`, auth error, timeout) is an `::error::` and
 fails the job rather than being read as "missing".
 
-| `<dest>:<version>` | Result |
+| State of `<dest>:<version>` across the destinations | Result |
 | --- | --- |
-| absent, `<dest>:sha-<8>` present | `docker buildx imagetools create -t <dest>:<version> <dest>:sha-<8>` |
-| present with `<dest>:sha-<8>`'s digest | nothing |
-| present with another digest | `::warning::`, left untouched |
+| absent everywhere | each created from its own `<dest>:sha-<8>` (or `<dest>:<tag>` on a tag build with `tag-build-args`) |
+| present somewhere, one digest | missing ones created from that digest (`imagetools create -t <dest>:<version> <present_dest>@<digest>`); present ones untouched |
+| present somewhere with one digest, which this commit's tag does not share | `::warning::` (the version belongs to another commit), nothing overwritten; the missing destinations still get the existing digest |
+| present with different digests on different destinations | `::error::` naming both digests, job fails, nothing written |
 | any read error | `::error::`, job fails, nothing written |
 
+The present digest is the release's content: a later commit that still carries
+the same version never changes what `:<version>` means, it only fills in a
+destination an earlier run left out.
+
 The job runs only when `version-file` is set and the `image` job succeeded
-(built or skipped), in a per-image concurrency group
-(`ci-workflows-image-version-<repo>-<image>`, `cancel-in-progress: false`), so
-two commits carrying the same version never both create it. GitHub keeps one
-pending job per group: a newer commit's run can replace a pending one, and it
-then tags its own commit — only where the version tag is still absent.
+(built or skipped), in a per-image, per-version concurrency group
+(`ci-workflows-image-version-<repo>-<image>-<version>`,
+`cancel-in-progress: false`), so two commits carrying the same version never
+both create it. GitHub keeps one pending job per group: a newer run for the
+same version can replace a pending one (it checks the same tag, and creates it
+only where it is still absent), while runs for different versions are in
+different groups and never cancel each other.
 
 ```yaml
 # profile-plugins-helm stunnel (vpro: repos/profile-plugins-helm.yaml):
@@ -253,7 +280,8 @@ then tags its own commit — only where the version tag is still absent.
 ```
 Caller permissions: `contents: read`, `packages: write`.
 Outputs: `digest` (from the build, or read back from the existing image when
-the build was skipped), `tag`.
+the build was skipped), `tag` (`sha-<8>`, or the tag name on a tag build with
+`tag-build-args`).
 
 The checkout keeps no credentials on disk (`persist-credentials: false`); the
 one fetch (`git fetch --no-tags origin main`, for the ancestor check of a
@@ -303,8 +331,13 @@ newer push on the same branch can replace a pending run, so that run never
 executes. The next push usually catches up (chart-releaser packages the charts
 changed since the last tag); if a release is missing after that, rerun the
 workflow with `workflow_dispatch` on that branch. Main and beta can now push
-gh-pages at the same time; should a simultaneous index push reject one of
-them, rerun that run.
+gh-pages at the same time; if a simultaneous index push makes chart-releaser's
+index step fail (its `git pull` aborts), the job waits 30 s, refreshes
+`origin/gh-pages`, and runs chart-releaser once more (`skip_existing` skips the
+release it already uploaded, and the index is rebuilt from the fresh gh-pages
+index plus this run's charts). If the retry fails too, the run is red and must
+be rerun at the same sha (a newer commit does not repackage that chart);
+rerunning is safe.
 
 Inputs: `charts-dir` (`charts`), `runs-on` (`ubuntu-latest`), `helm-version`
 (`v3.19.0`), `release-branch` (`main`), `prerelease-branch` (empty),

@@ -229,6 +229,24 @@ expect_out "meta: public tag build pushes sha and the tag" "$out" tags \
   "ghcr.io/teknoir/x:sha-${sha8}\\nghcr.io/teknoir/x:v1.2.3"
 expect_out "meta: no version tag in the build's tag list" "$out" version ''
 
+# tag-build-args on a tag: the build pushes only the tag name, never sha-<8>,
+# so the branch artifact stays immutable and the tag gets its own build args.
+out="$tmp/meta-tagargs.out"
+: > "$out"
+if run_step "Compute tags and source date" \
+  GITHUB_OUTPUT="$out" GITHUB_ENV="$tmp/meta-tagargs.env" \
+  GITHUB_SHA="$sha" GITHUB_REF=refs/tags/v1.2.3 GITHUB_REF_NAME=v1.2.3 \
+  VISIBILITY=public IMAGE=x TAG_BUILD_ARGS='VERSION={ref}'; then
+  pass "meta step (tag, public, tag-build-args) succeeds"
+else
+  fail "meta step (tag, public, tag-build-args) succeeds"
+  cat "$tmp/step.log" >&2
+fi
+expect_out "meta: a tag build with tag-build-args pushes no sha-<8>" "$out" tags \
+  'ghcr.io/teknoir/x:v1.2.3'
+expect_out "meta: a tag build with tag-build-args reports the tag name" "$out" tag \
+  'v1.2.3'
+
 out="$tmp/meta-badimage.out"
 : > "$out"
 : > "$tmp/step.log"
@@ -372,8 +390,9 @@ expect_eq "version-tag: harbor version tag from harbor's sha tag" 1 \
 expect_eq "version-tag: ghcr version tag from ghcr's sha tag" 1 \
   grep -c 'create -t ghcr.io/teknoir/x:1.2.3 ghcr.io/teknoir/x:sha-01234567' "$out"
 
-# Finding 11: harbor has the version tag, ghcr does not; the sha tag exists
-# in both. ghcr's version tag is still created from ghcr's own sha tag.
+# Findings 11 and 2: harbor has the version tag, ghcr does not. The present
+# destination's digest is the release's content, so ghcr is created from it,
+# not from ghcr's own sha tag (which could belong to other code).
 out="$tmp/vtag-partial.log"
 : > "$out"
 if run_step "Add the version tag" \
@@ -388,10 +407,53 @@ else
   tail -20 "$tmp/step.log" >&2
 fi
 expect_eq "version-tag: only the missing destination gets a create" 1 create_calls "$out"
-expect_eq "version-tag: the created tag is ghcr's" 1 \
-  grep -c 'create -t ghcr.io/teknoir/x:1.2.3' "$out"
+expect_eq "version-tag: the created tag comes from the present destination's digest" 1 \
+  grep -c 'create -t ghcr.io/teknoir/x:1.2.3 harbor.teknoir.cloud/teknoir/x@sha256:aaa' "$out"
 expect_eq "version-tag: the existing tag is not touched" 0 \
   grep -c 'create -t harbor.teknoir.cloud/teknoir/x:1.2.3' "$out"
+
+# Finding 2: the version exists on another commit's digest and this commit
+# carries the same version. ghcr is created from harbor's digest, and the
+# differing digest is warned about, never overwritten.
+out="$tmp/vtag-canonical.log"
+: > "$out"
+if run_step "Add the version tag" \
+  DOCKER_LOG="$out" \
+  EXISTING="harbor.teknoir.cloud/teknoir/x:1.2.3=sha256:old harbor.teknoir.cloud/teknoir/x:sha-${sha8}=sha256:new ghcr.io/teknoir/x:sha-${sha8}=sha256:new" \
+  UNVERIFIABLE='' \
+  DESTINATIONS=$'harbor.teknoir.cloud/teknoir/x\nghcr.io/teknoir/x' \
+  "${vtag_common[@]}"; then
+  pass "version-tag: a missing destination is created from the other one's digest"
+else
+  fail "version-tag: a missing destination is created from the other one's digest"
+  tail -20 "$tmp/step.log" >&2
+fi
+expect_eq "version-tag: exactly one create" 1 create_calls "$out"
+expect_eq "version-tag: ghcr is created from harbor's existing digest, not this commit" 1 \
+  grep -c 'create -t ghcr.io/teknoir/x:1.2.3 harbor.teknoir.cloud/teknoir/x@sha256:old' "$out"
+expect_eq "version-tag: the other commit's sha tag is not the source" 0 \
+  grep -c 'create -t ghcr.io/teknoir/x:1.2.3 ghcr.io/teknoir/x:sha-' "$out"
+expect_eq "version-tag: the differing digest warns" 1 \
+  grep -c '::warning::harbor.teknoir.cloud/teknoir/x:1.2.3 already exists with digest sha256:old' "$tmp/step.log"
+
+# Finding 2: the destinations already disagree on the version's digest. Fail
+# with ::error:: naming both digests, and write nothing.
+out="$tmp/vtag-disagree.log"
+: > "$out"
+: > "$tmp/step.log"
+if run_step "Add the version tag" \
+  DOCKER_LOG="$out" \
+  EXISTING="harbor.teknoir.cloud/teknoir/x:1.2.3=sha256:old ghcr.io/teknoir/x:1.2.3=sha256:other" \
+  UNVERIFIABLE='' \
+  DESTINATIONS=$'harbor.teknoir.cloud/teknoir/x\nghcr.io/teknoir/x' \
+  "${vtag_common[@]}"; then
+  fail "version-tag: disagreeing destinations fail the step (expected non-zero)"
+else
+  pass "version-tag: disagreeing destinations fail the step"
+fi
+expect_eq "version-tag: a disagreement creates nothing" 0 create_calls "$out"
+expect_eq "version-tag: the disagreement names both digests" 1 \
+  grep -c '::error::harbor.teknoir.cloud/teknoir/x:1.2.3 is sha256:old but ghcr.io/teknoir/x:1.2.3 is sha256:other' "$tmp/step.log"
 
 # Same digest everywhere: nothing to do.
 out="$tmp/vtag-same.log"
@@ -449,8 +511,9 @@ fi
 expect_eq "version-tag: nothing is created from a missing sha tag" 0 create_calls "$out"
 
 # ------------------------------------------------------------ skip step
-# The public v* tag is backfilled from the sha tag when the sha tag exists;
-# a registry error on it fails closed instead of creating the tag.
+# With empty tag-build-args, the public v* tag is backfilled from the sha tag
+# when the sha tag exists; a registry error on it fails closed instead of
+# creating the tag.
 out="$tmp/skip-ok.log"
 gha="$tmp/skip-ok.out"
 : > "$out"
@@ -458,6 +521,7 @@ gha="$tmp/skip-ok.out"
 if run_step "Skip if the image already exists" \
   DOCKER_LOG="$out" GITHUB_OUTPUT="$gha" \
   EXISTING="ghcr.io/teknoir/x:sha-${sha8}=sha256:aaa" UNVERIFIABLE='' \
+  GITHUB_REF=refs/tags/v1.2.3 TAG_BUILD_ARGS='' \
   FIRST_DESTINATION=ghcr.io/teknoir/x TAG="sha-${sha8}" \
   TAGS=$'ghcr.io/teknoir/x:sha-'"${sha8}"$'\nghcr.io/teknoir/x:v1.2.3'; then
   pass "skip step: existing sha tag backfills the ref tag"
@@ -496,6 +560,68 @@ else
 fi
 expect_eq "skip step: a registry error does not report a missing image" 0 \
   grep -c '^exists=' "$gha"
+
+# Finding 1: a tag build with tag-build-args pushes only the tag name, so the
+# sha tag's presence must not shortcut the build: the tag's own build args
+# have to reach it.
+out="$tmp/skip-tagargs-new.log"
+gha="$tmp/skip-tagargs-new.out"
+: > "$out"
+: > "$gha"
+if run_step "Skip if the image already exists" \
+  DOCKER_LOG="$out" GITHUB_OUTPUT="$gha" \
+  EXISTING="ghcr.io/teknoir/x:sha-${sha8}=sha256:aaa" UNVERIFIABLE='' \
+  GITHUB_REF=refs/tags/v1.2.3 TAG_BUILD_ARGS='VERSION={ref}' \
+  FIRST_DESTINATION=ghcr.io/teknoir/x TAG='v1.2.3' \
+  TAGS='ghcr.io/teknoir/x:v1.2.3'; then
+  pass "skip step: a tag build with tag-build-args runs even when sha-<8> exists"
+else
+  fail "skip step: a tag build with tag-build-args runs even when sha-<8> exists"
+  cat "$tmp/step.log" >&2
+fi
+expect_out "skip step: the sha tag does not make the tag build skip" "$gha" exists 'false'
+expect_eq "skip step: the tag build creates nothing when the tag is absent" 0 create_calls "$out"
+
+# Every tag of the tag build already exists: skip, and report the digest.
+out="$tmp/skip-tagargs-present.log"
+gha="$tmp/skip-tagargs-present.out"
+: > "$out"
+: > "$gha"
+if run_step "Skip if the image already exists" \
+  DOCKER_LOG="$out" GITHUB_OUTPUT="$gha" \
+  EXISTING="ghcr.io/teknoir/x:v1.2.3=sha256:ccc" UNVERIFIABLE='' \
+  GITHUB_REF=refs/tags/v1.2.3 TAG_BUILD_ARGS='VERSION={ref}' \
+  FIRST_DESTINATION=ghcr.io/teknoir/x TAG='v1.2.3' \
+  TAGS='ghcr.io/teknoir/x:v1.2.3'; then
+  pass "skip step: an existing tag skips the tag build"
+else
+  fail "skip step: an existing tag skips the tag build"
+  cat "$tmp/step.log" >&2
+fi
+expect_out "skip step: an existing tag means exists=true" "$gha" exists 'true'
+expect_out "skip step: the existing tag's digest is reported" "$gha" digest 'sha256:ccc'
+expect_eq "skip step: an existing tag is never overwritten" 0 create_calls "$out"
+
+# Some of the tag build's destinations have the tag, others do not: fail
+# closed rather than push a release split across destinations.
+out="$tmp/skip-tagargs-split.log"
+gha="$tmp/skip-tagargs-split.out"
+: > "$out"
+: > "$gha"
+: > "$tmp/step.log"
+if run_step "Skip if the image already exists" \
+  DOCKER_LOG="$out" GITHUB_OUTPUT="$gha" \
+  EXISTING="harbor.teknoir.cloud/teknoir/x:v1.2.3=sha256:ccc" UNVERIFIABLE='' \
+  GITHUB_REF=refs/tags/v1.2.3 TAG_BUILD_ARGS='VERSION={ref}' \
+  FIRST_DESTINATION=harbor.teknoir.cloud/teknoir/x TAG='v1.2.3' \
+  TAGS=$'harbor.teknoir.cloud/teknoir/x:v1.2.3\nghcr.io/teknoir/x:v1.2.3'; then
+  fail "skip step: a partly tagged tag build fails closed (expected non-zero)"
+else
+  pass "skip step: a partly tagged tag build fails closed"
+fi
+expect_eq "skip step: a partly tagged tag build creates nothing" 0 create_calls "$out"
+expect_eq "skip step: the split names the existing tag" 1 \
+  grep -c '::error::1 of this tag build.s tags already exist and 1 do not' "$tmp/step.log"
 
 # ------------------------------------------------------------ end to end
 # The image job's outputs feed the version-tag job, as the workflow wires them

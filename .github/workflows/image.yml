@@ -9,9 +9,12 @@ name: image (reusable)
 #   public:  ghcr.io/teknoir/<image>, from refs/heads/main or a refs/tags/v*
 #            tag that is on origin/main; a tag also pushes :<tag name>.
 # A version-file adds an immutable :<version> tag (never overwritten). It is
-# added after the build by the separate version-tag job, from the sha-<8> tag
-# this run pushed. build-args may be templated with {sha8}, {sha7}, {sha},
-# {ref}, {version}; tag-build-args overrides them on a tag build.
+# added after the build by the separate version-tag job, from the tag this run
+# pushed (sha-<8>, or the tag name on a tag build with tag-build-args).
+# build-args may be templated with {sha8}, {sha7}, {sha}, {ref}, {version};
+# tag-build-args overrides them on a tag build, and such a build pushes only
+# :<tag name> (never sha-<8>), so the branch artifact stays immutable while the
+# released binary carries the tag's build args.
 # Never pushes latest or a branch-name tag. Runs on teknoir-push for private
 # repos (its pod carries BUILDKIT_HOST and the Harbor push robot).
 
@@ -94,7 +97,9 @@ on:
         description: Digest of the pushed image.
         value: ${{ jobs.image.outputs.digest }}
       tag:
-        description: Tag of the pushed image (sha-<8>).
+        description: >-
+          Tag of the pushed image: sha-<8>, or the tag name on a tag build with
+          tag-build-args (which pushes no sha-<8>).
         value: ${{ jobs.image.outputs.tag }}
 
 permissions: {}
@@ -161,12 +166,18 @@ jobs:
       # The build pushes the sha-<8> tag only (plus the ref's own tag on a
       # public v* build). The version tag is not in this list: the version-tag
       # job adds it afterwards, from this commit's sha tag.
+      #
+      # A tag build whose tag-build-args is non-empty is the exception: it
+      # pushes only <dest>:<tag name> and never sha-<8>, so the branch's sha-<8>
+      # artifact stays immutable (vpro's keep_ref) while the tag's own build
+      # args reach the released binary. Its `tag` output is the tag name.
       - name: Compute tags and source date
         id: meta
         shell: bash
         env:
           VISIBILITY: ${{ inputs.visibility }}
           IMAGE: ${{ inputs.image }}
+          TAG_BUILD_ARGS: ${{ inputs.tag-build-args }}
         run: |
           set -euo pipefail
           # BEGIN image-lib - must stay identical to scripts/image-lib.sh
@@ -243,6 +254,19 @@ jobs:
           # END image-lib
 
           tag="sha-${GITHUB_SHA::8}"
+          ref_tag=""
+          tag_build_args=false
+          if [[ "${GITHUB_REF}" == refs/tags/* && -n "${TAG_BUILD_ARGS:-}" ]]; then
+            tag_build_args=true
+            ref_tag="${GITHUB_REF#refs/tags/}"
+            if [[ "$ref_tag" == latest ]]; then
+              echo "::error::refusing to push latest."
+              exit 1
+            fi
+            # This run pushes the tag, not sha-<8>; the version-tag job tags
+            # :<version> from it.
+            tag="$ref_tag"
+          fi
           epoch=$(git log -1 --format=%ct)
           if [[ -z "$IMAGE" ]] || [[ ! "$IMAGE" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]; then
             echo "::error::image '${IMAGE}' is not a valid repository name (lowercase, without registry or tag, e.g. backstage or toe-app)."
@@ -264,6 +288,12 @@ jobs:
             exit 1
           fi
           for dest in "${dests[@]}"; do
+            if [[ "$tag_build_args" == true ]]; then
+              # The tag only: sha-<8> belongs to the branch build, which baked
+              # the branch's build args.
+              tags+=("${dest}:${ref_tag}")
+              continue
+            fi
             tags+=("${dest}:${tag}")
             # Private builds push sha-<8> only. A public v* build also pushes
             # the tag name: the caller asked for that ref to be published.
@@ -519,6 +549,10 @@ jobs:
       # The sha tag is the only thing ever built; the other tag in the list
       # (a public v* tag) is created from it when it is already there. A
       # version tag is not in this list at all: the version-tag job adds it.
+      #
+      # A tag build with tag-build-args never pushes sha-<8>; its tag list is
+      # the tags themselves. None there: build. All there: skip. Some there:
+      # fail closed, so one release is never split across destinations.
       - name: Skip if the image already exists
         id: exists
         shell: bash
@@ -526,6 +560,7 @@ jobs:
           FIRST_DESTINATION: ${{ steps.meta.outputs.first_destination }}
           TAG: ${{ steps.meta.outputs.tag }}
           TAGS: ${{ steps.meta.outputs.tags }}
+          TAG_BUILD_ARGS: ${{ inputs.tag-build-args }}
         run: |
           set -euo pipefail
           # BEGIN image-lib - must stay identical to scripts/image-lib.sh
@@ -612,6 +647,42 @@ jobs:
             STATE=$out
           }
 
+          if [[ "${GITHUB_REF:-}" == refs/tags/* && -n "${TAG_BUILD_ARGS:-}" ]]; then
+            # The build would push these tags only, with the tag's own build
+            # args. An existing tag is never overwritten: if any is there, the
+            # build cannot produce the rest without splitting the release.
+            present=0
+            absent=0
+            present_ref=""
+            while IFS= read -r ref; do
+              [[ -n "$ref" ]] || continue
+              state_of "$ref"
+              if [[ "$STATE" == present ]]; then
+                present=$((present + 1))
+                present_ref=$ref
+              else
+                absent=$((absent + 1))
+              fi
+            done <<< "$TAGS"
+            if [[ "$absent" -eq 0 ]]; then
+              digest=$(docker buildx imagetools inspect "$present_ref" \
+                --format '{{json .Manifest}}' | jq -r '.digest // empty')
+              if [[ -z "$digest" ]]; then
+                echo "::error::could not read the digest of ${present_ref}."
+                exit 1
+              fi
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+              echo "Every tag of this build already exists; skipping the build."
+              exit 0
+            fi
+            if [[ "$present" -gt 0 ]]; then
+              echo "::error::${present} of this tag build's tags already exist and ${absent} do not (${present_ref} is present); building would push only some of them and leave one release split across destinations. Delete the existing tag(s) or bump the tag."
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           sha_ref="${FIRST_DESTINATION}:${TAG}"
           state_of "$sha_ref"
           if [[ "$STATE" == absent ]]; then
@@ -719,23 +790,26 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Adds :<version> to every destination, from the sha-<8> tag the image job
-  # pushed. A version tag names an immutable release: it is created only where
-  # the registry positively reports it missing, on a digest equal to this
-  # commit's sha tag. Runs after a successful build or skip, and only for a
-  # version-file.
+  # Adds :<version> to every destination. A version tag names an immutable
+  # release: it is created only where the registry positively reports it
+  # missing. Where no destination has it yet, each is tagged from the tag this
+  # run pushed; where some destination has it, the others are created from that
+  # digest, and destinations that disagree on the digest fail the job. Runs
+  # after a successful build or skip, and only for a version-file.
   version-tag:
     name: version-tag
     needs: image
     if: inputs.version-file != ''
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 15
-    # One run per image at a time: two commits carrying the same version must
-    # not both create <dest>:<version>. GitHub keeps one pending job per group,
-    # so a newer commit's run can replace a pending one; that run then tags its
-    # own commit, and only where the version tag is still absent.
+    # One run per image and version at a time: two commits carrying the same
+    # version must not both create <dest>:<version>. GitHub keeps one pending
+    # job per group, so a newer run for the same version can replace a pending
+    # one; it checks the same tag and creates it only where it is still absent.
+    # Runs for different versions are in different groups and never replace
+    # each other.
     concurrency:
-      group: ci-workflows-image-version-${{ github.repository }}-${{ inputs.image }}
+      group: ci-workflows-image-version-${{ github.repository }}-${{ inputs.image }}-${{ needs.image.outputs.version_tag }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -895,16 +969,26 @@ jobs:
             printf '%s' "$d"
           }
 
-          # Pass 1: read every destination's state, so a registry error aborts
-          # before any tag is written.
+          # Pass 1: read every destination's state and, where the version tag
+          # exists, its digest. A registry error aborts here, before any tag is
+          # written.
           dests=()
           states=()
           sha_states=()
+          version_digests=()
           while IFS= read -r dest; do
             [[ -n "$dest" ]] || continue
             dests+=("$dest")
             state_of "${dest}:${VERSION_TAG}"
             states+=("$STATE")
+            if [[ "$STATE" == present ]]; then
+              version_digests+=("$(digest_of "${dest}:${VERSION_TAG}")") || {
+                echo "::error::could not read the digest of ${dest}:${VERSION_TAG}."
+                exit 1
+              }
+            else
+              version_digests+=("")
+            fi
             state_of "${dest}:${TAG}"
             sha_states+=("$STATE")
           done <<< "$DESTINATIONS"
@@ -913,40 +997,75 @@ jobs:
             exit 1
           fi
 
-          # Pass 2: create the missing version tags, leave existing ones alone.
+          # A version names one release, so every destination that has it must
+          # agree on its digest. Disagreement is fatal and writes nothing: the
+          # destinations already serve different content for the same version,
+          # and tagging the rest from either would make it worse.
+          canonical=""
+          canonical_dest=""
+          for i in "${!dests[@]}"; do
+            [[ "${states[$i]}" == present ]] || continue
+            version_digest="${version_digests[$i]}"
+            if [[ -z "$canonical" ]]; then
+              canonical="$version_digest"
+              canonical_dest="${dests[$i]}"
+            elif [[ "$version_digest" != "$canonical" ]]; then
+              echo "::error::${canonical_dest}:${VERSION_TAG} is ${canonical} but ${dests[$i]}:${VERSION_TAG} is ${version_digest}; the destinations disagree on ${VERSION_TAG}, so nothing is written."
+              exit 1
+            fi
+          done
+
           created=0
           present=0
-          for i in "${!dests[@]}"; do
-            dest="${dests[$i]}"
-            version_ref="${dest}:${VERSION_TAG}"
-            sha_ref="${dest}:${TAG}"
-            if [[ "${states[$i]}" == absent ]]; then
+          if [[ -z "$canonical" ]]; then
+            # No destination has this version yet: each is tagged from its own
+            # sha-<8> tag, pushed by the image job.
+            for i in "${!dests[@]}"; do
+              dest="${dests[$i]}"
+              sha_ref="${dest}:${TAG}"
               if [[ "${sha_states[$i]}" != present ]]; then
-                echo "::error::${sha_ref} does not exist, so ${version_ref} cannot be tagged from it."
+                echo "::error::${sha_ref} does not exist, so ${dest}:${VERSION_TAG} cannot be tagged from it."
                 exit 1
               fi
-              docker buildx imagetools create -t "$version_ref" "$sha_ref"
-              echo "Created ${version_ref} from ${sha_ref}."
+              docker buildx imagetools create -t "${dest}:${VERSION_TAG}" "$sha_ref"
+              echo "Created ${dest}:${VERSION_TAG} from ${sha_ref}."
               created=$((created + 1))
-              continue
-            fi
-            version_digest=$(digest_of "$version_ref") || {
-              echo "::error::could not read the digest of ${version_ref}."
+            done
+            echo "Version ${VERSION} as ${VERSION_TAG}: ${created} created, ${present} already present."
+            exit 0
+          fi
+
+          # Some destination has the version: its digest is the release's
+          # content. Missing destinations are created from that digest (not
+          # from this commit, which may carry the same version on other code),
+          # and the present ones are left untouched.
+          this_commit=false
+          this_digest=""
+          for i in "${!dests[@]}"; do
+            [[ "${sha_states[$i]}" == present ]] || continue
+            this_digest=$(digest_of "${dests[$i]}:${TAG}") || {
+              echo "::error::could not read the digest of ${dests[$i]}:${TAG}."
               exit 1
             }
-            present=$((present + 1))
-            if [[ "${sha_states[$i]}" != present ]]; then
-              echo "::warning::${version_ref} already exists and ${sha_ref} does not; versions are immutable, so it is left as it is."
+            if [[ "$this_digest" == "$canonical" ]]; then
+              this_commit=true
+              break
+            fi
+          done
+          if [[ "$this_commit" == true ]]; then
+            echo "The present ${VERSION_TAG} tags already point at this commit's digest."
+          else
+            echo "::warning::${canonical_dest}:${VERSION_TAG} already exists with digest ${canonical}, which is not this commit's digest (${this_digest:-no ${TAG} tag anywhere}); versions are immutable, so it is left as it is and the missing destinations are created from it."
+          fi
+          for i in "${!dests[@]}"; do
+            version_ref="${dests[$i]}:${VERSION_TAG}"
+            if [[ "${states[$i]}" == present ]]; then
+              echo "${version_ref} already exists with digest ${canonical}; nothing to do."
+              present=$((present + 1))
               continue
             fi
-            sha_digest=$(digest_of "$sha_ref") || {
-              echo "::error::could not read the digest of ${sha_ref}."
-              exit 1
-            }
-            if [[ "$sha_digest" == "$version_digest" ]]; then
-              echo "${version_ref} already points at this commit's digest; nothing to do."
-            else
-              echo "::warning::${version_ref} already exists with digest ${version_digest}, not ${sha_digest} (${TAG}); versions are immutable, so it is left as it is."
-            fi
+            docker buildx imagetools create -t "$version_ref" "${canonical_dest}@${canonical}"
+            echo "Created ${version_ref} from ${canonical_dest}@${canonical}."
+            created=$((created + 1))
           done
           echo "Version ${VERSION} as ${VERSION_TAG}: ${created} created, ${present} already present."
