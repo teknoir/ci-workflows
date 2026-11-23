@@ -47,3 +47,49 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/test-land.sh
+
+      - name: Test image-lib helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-image-lib.sh
+
+      # Runs the bash steps of image.yml as extracted from the YAML, against a
+      # stub docker and an emulation of the runner's GITHUB_OUTPUT parser.
+      - name: Test image.yml steps
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-image-steps.sh
+
+      # image.yml does not check out this repo, so each of its bash steps that
+      # needs the helpers carries an inline copy of scripts/image-lib.sh. Every
+      # copy must stay identical to the lib.
+      - name: Diff the inline image-lib copies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The lib itself, without the markers and without YAML indentation.
+          sed -n '/BEGIN image-lib/,/END image-lib/p' scripts/image-lib.sh |
+            sed '1d;$d' | sed 's/^ *//' > "$RUNNER_TEMP"/image-lib.sh
+          # Every copy in image.yml, one file each.
+          rm -f "$RUNNER_TEMP"/image-inline-*.sh
+          sed -n '/BEGIN image-lib/,/END image-lib/p' .github/workflows/image.yml |
+            sed 's/^ *//' | awk -v dir="$RUNNER_TEMP" '
+              /^# BEGIN image-lib/ { n++; f = sprintf("%s/image-inline-%d.sh", dir, n); next }
+              /^# END image-lib/ { f = ""; next }
+              f != "" { print > f }
+            '
+          count=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'image-inline-*.sh' | wc -l)
+          if ((count == 0)); then
+            echo '::error::no inline image-lib copy found in .github/workflows/image.yml.'
+            exit 1
+          fi
+          for copy in "$RUNNER_TEMP"/image-inline-*.sh; do
+            if ! diff -u "$RUNNER_TEMP"/image-lib.sh "$copy"; then
+              echo "::error::an image-lib copy in .github/workflows/image.yml (${copy##*/}) differs from scripts/image-lib.sh; keep them identical."
+              exit 1
+            fi
+            echo "${copy##*/}: identical to scripts/image-lib.sh"
+          done
+          echo "${count} inline copies checked."
