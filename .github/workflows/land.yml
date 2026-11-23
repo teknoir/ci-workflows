@@ -158,6 +158,19 @@ jobs:
           node-version-file: ${{ inputs.node-version-file }}
           cache: ''
 
+      - name: Enable Yarn (corepack)
+        if: steps.select.outputs.skip != 'true' && inputs.node-version-file != ''
+        shell: bash
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        run: |
+          # setup-node ships npm only. A yarn.lock means Yarn: corepack provides it
+          # (the version in package.json packageManager, else Yarn classic 1.x).
+          if [[ -f yarn.lock ]] && ! command -v yarn >/dev/null; then
+            corepack enable
+            yarn --version
+          fi
+
       - name: Set up envtest
         if: steps.select.outputs.skip != 'true' && inputs.setup-envtest
         shell: bash
