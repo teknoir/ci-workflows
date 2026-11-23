@@ -61,6 +61,12 @@ on:
         description: Branch to merge into.
         type: string
         default: main
+      ci-workflows-ref:
+        description: >-
+          Ref of teknoir/ci-workflows whose scripts/land.sh runs. Keep it equal
+          to the ref in your `uses:` line (only changed to test a branch).
+        type: string
+        default: main
 
 permissions: {}
 
@@ -113,7 +119,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: teknoir/ci-workflows
-          ref: main
+          ref: ${{ inputs.ci-workflows-ref }}
           path: .ci-workflows
           fetch-depth: 1
           persist-credentials: false
@@ -207,7 +213,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: teknoir/ci-workflows
-          ref: main
+          ref: ${{ inputs.ci-workflows-ref }}
           path: .ci-workflows
           fetch-depth: 1
           persist-credentials: false
@@ -243,7 +249,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: teknoir/ci-workflows
-          ref: main
+          ref: ${{ inputs.ci-workflows-ref }}
           path: .ci-workflows
           fetch-depth: 1
           persist-credentials: false

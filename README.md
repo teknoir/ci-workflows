@@ -63,7 +63,7 @@ installed into that `GOMODCACHE`. Inputs: `runs-on` (`teknoir-land`), `label`
 `image-workflow` (dispatched on the base branch after the merge, usually
 `image.yml`), `test-workflow` (dispatched on the base branch when the merge
 lands on a base that was not tested, usually `test.yml`; empty: no dispatch),
-`base` (`main`).
+`base` (`main`), `ci-workflows-ref` (`main`; the ref whose `scripts/land.sh` runs, keep it equal to your `uses:` ref; change it only to test a branch).
 Caller permissions: `contents: write`, `pull-requests: write`,
 `actions: write`.
 
