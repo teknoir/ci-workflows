@@ -384,6 +384,44 @@ test_caller_workflow_file_other_name() {
 }
 expect_ok "caller workflow file with another name" test_caller_workflow_file_other_name
 
+# --- multi-directory groups (same dependency listed once per directory) ----
+
+# shellcheck disable=SC2016
+dep_commit_multidir='Bump the gomod group across 2 directories with 2 updates
+
+---
+updated-dependencies:
+- dependency-name: cloud.google.com/go/pubsub
+  dependency-version: 1.52.0
+  dependency-type: direct:production
+  update-type: version-update:semver-minor
+  dependency-group: gomod
+- dependency-name: github.com/sirupsen/logrus
+  dependency-version: 1.10.2
+  dependency-type: direct:production
+  update-type: version-update:semver-minor
+  dependency-group: gomod
+- dependency-name: cloud.google.com/go/pubsub
+  dependency-version: 1.52.0
+  dependency-type: direct:production
+  update-type: version-update:semver-minor
+  dependency-group: gomod
+...
+'
+
+expect_eq "dependabot_unique_name_count: multi-directory" '2' \
+  dependabot_unique_name_count "$dep_commit_multidir"
+expect_eq "dependabot_unique_name_count: grouped (quoted names)" '2' \
+  dependabot_unique_name_count "$dep_commit_grouped"
+expect_eq "dependabot_entry_count: multi-directory counts every entry" '3' \
+  dependabot_entry_count "$dep_commit_multidir"
+expect_ok "dependabot: multi-directory group, title counts distinct names" \
+  dependabot_commits_allowed 'Bump the gomod group across 2 directories with 2 updates' "$dep_commit_multidir"
+expect_no "dependabot: multi-directory group, title count matches neither" \
+  dependabot_commits_allowed 'Bump the gomod group across 2 directories with 4 updates' "$dep_commit_multidir"
+expect_no "dependabot: grouped, title count above the distinct names" \
+  dependabot_commits_allowed 'Bump the aws-sdk group with 3 updates' "$dep_commit_grouped"
+
 # --- result ----------------------------------------------------------------
 
 printf '\n%s tests, %s failed\n' "$tests" "$failures"
