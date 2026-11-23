@@ -386,9 +386,9 @@ else
 fi
 expect_eq "version-tag: creates the version tag in both destinations" 2 create_calls "$out"
 expect_eq "version-tag: harbor version tag from harbor's sha tag" 1 \
-  grep -c 'create -t harbor.teknoir.cloud/teknoir/x:1.2.3 harbor.teknoir.cloud/teknoir/x:sha-01234567' "$out"
+  grep -c 'create --prefer-index=false -t harbor.teknoir.cloud/teknoir/x:1.2.3 harbor.teknoir.cloud/teknoir/x:sha-01234567' "$out"
 expect_eq "version-tag: ghcr version tag from ghcr's sha tag" 1 \
-  grep -c 'create -t ghcr.io/teknoir/x:1.2.3 ghcr.io/teknoir/x:sha-01234567' "$out"
+  grep -c 'create --prefer-index=false -t ghcr.io/teknoir/x:1.2.3 ghcr.io/teknoir/x:sha-01234567' "$out"
 
 # Findings 11 and 2: harbor has the version tag, ghcr does not. The present
 # destination's digest is the release's content, so ghcr is created from it,
@@ -410,7 +410,7 @@ expect_eq "version-tag: only the missing destination gets a create" 1 create_cal
 expect_eq "version-tag: the created tag comes from the present destination's digest" 1 \
   grep -c 'create -t ghcr.io/teknoir/x:1.2.3 harbor.teknoir.cloud/teknoir/x@sha256:aaa' "$out"
 expect_eq "version-tag: the existing tag is not touched" 0 \
-  grep -c 'create -t harbor.teknoir.cloud/teknoir/x:1.2.3' "$out"
+  grep -cE 'create (--prefer-index=false )?-t harbor.teknoir.cloud/teknoir/x:1.2.3' "$out"
 
 # Finding 2: the version exists on another commit's digest and this commit
 # carries the same version. ghcr is created from harbor's digest, and the
@@ -432,7 +432,7 @@ expect_eq "version-tag: exactly one create" 1 create_calls "$out"
 expect_eq "version-tag: ghcr is created from harbor's existing digest, not this commit" 1 \
   grep -c 'create -t ghcr.io/teknoir/x:1.2.3 harbor.teknoir.cloud/teknoir/x@sha256:old' "$out"
 expect_eq "version-tag: the other commit's sha tag is not the source" 0 \
-  grep -c 'create -t ghcr.io/teknoir/x:1.2.3 ghcr.io/teknoir/x:sha-' "$out"
+  grep -cE 'create (--prefer-index=false )?-t ghcr.io/teknoir/x:1.2.3 ghcr.io/teknoir/x:sha-' "$out"
 expect_eq "version-tag: the differing digest warns" 1 \
   grep -c '::warning::harbor.teknoir.cloud/teknoir/x:1.2.3 already exists with digest sha256:old' "$tmp/step.log"
 
@@ -532,7 +532,7 @@ fi
 expect_out "skip step: exists=true and the digest" "$gha" exists 'true'
 expect_out "skip step: digest read back" "$gha" digest 'sha256:aaa'
 expect_eq "skip step: the missing ref tag is created from the sha tag" 1 \
-  grep -c 'create -t ghcr.io/teknoir/x:v1.2.3 ghcr.io/teknoir/x:sha-01234567' "$out"
+  grep -c 'create --prefer-index=false -t ghcr.io/teknoir/x:v1.2.3 ghcr.io/teknoir/x:sha-01234567' "$out"
 
 out="$tmp/skip-new.log"
 gha="$tmp/skip-new.out"
@@ -657,7 +657,7 @@ else
 fi
 expect_eq "end to end: both destinations get the version tag" 2 create_calls "$log"
 expect_eq "end to end: the tag comes from VERSION (1.2.3) in each destination" 2 \
-  grep -cE 'create -t (harbor\.teknoir\.cloud/teknoir|ghcr\.io/teknoir)/x:1\.2\.3 ' "$log"
+  grep -cE 'create --prefer-index=false -t (harbor\.teknoir\.cloud/teknoir|ghcr\.io/teknoir)/x:1\.2\.3 ' "$log"
 
 # ----------------------------------------------------------------- report
 printf '\n%d tests, %d failures\n' "$tests" "$failures"

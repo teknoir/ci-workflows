@@ -332,12 +332,13 @@ executes. The next push usually catches up (chart-releaser packages the charts
 changed since the last tag); if a release is missing after that, rerun the
 workflow with `workflow_dispatch` on that branch. Main and beta can now push
 gh-pages at the same time; if a simultaneous index push makes chart-releaser's
-index step fail (its `git pull` aborts), the job waits 30 s, refreshes
-`origin/gh-pages`, and runs chart-releaser once more (`skip_existing` skips the
-release it already uploaded, and the index is rebuilt from the fresh gh-pages
-index plus this run's charts). If the retry fails too, the run is red and must
-be rerun at the same sha (a newer commit does not repackage that chart);
-rerunning is safe.
+index step fail (its `git pull` aborts), the job checks that every package of
+this run already has its uploaded release, refreshes `origin/gh-pages` and runs
+only `cr index --push` again (up to 3 times, 15/30/45 s apart), from the same
+package files, so the index digest matches the uploaded asset. A successful
+retry leaves the run green. Any other chart-releaser failure (packaging,
+upload) is not retried and the run is red: fix the cause and rerun at the same
+sha (a newer commit does not repackage that chart); rerunning is safe.
 
 Inputs: `charts-dir` (`charts`), `runs-on` (`ubuntu-latest`), `helm-version`
 (`v3.19.0`), `release-branch` (`main`), `prerelease-branch` (empty),

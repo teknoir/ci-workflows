@@ -142,6 +142,9 @@ jobs:
 
       - name: Run chart-releaser
         id: cr
+        # A failure here is retried below (index push only); the retry step
+        # decides the job's result.
+        continue-on-error: true
         uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
         with:
           charts_dir: ${{ inputs.charts-dir }}
@@ -152,29 +155,44 @@ jobs:
           CR_TOKEN: ${{ github.token }}
 
       # A run on the other branch can push gh-pages between this run's checkout
-      # and its index push; cr's index `git pull` then aborts and cr upload has
-      # already created the release, so only the index entry is missing. Wait
-      # for the other push to settle, refresh the ref chart-releaser builds its
-      # index worktree from (it never fetches), then run chart-releaser again:
-      # skip_existing skips the existing release, and the index is rebuilt from
-      # the fresh gh-pages index plus this run's charts.
-      - name: Wait, then refresh the gh-pages ref
-        if: failure() && steps.cr.outcome == 'failure'
+      # and its index push; cr's index `git pull` then aborts after cr upload
+      # has created the releases, so only the index entry is missing. Rebuild
+      # just the index from the packages this run already uploaded (same bytes,
+      # so the index digest matches the release asset), after refreshing the
+      # gh-pages ref cr builds its index worktree from (cr never fetches it).
+      # Any other failure (packaging, upload) has no uploaded release for every
+      # package, so the step refuses and the job goes red.
+      - name: Retry the index push
+        if: ${{ !cancelled() && steps.cr.outcome == 'failure' }}
         shell: bash
-        run: |
-          set -euo pipefail
-          sleep 30
-          # gh-pages may not exist yet on a first release; the index push
-          # creates it.
-          git fetch origin 'gh-pages:refs/remotes/origin/gh-pages' ||
-            echo "gh-pages not fetched; the retry will retry it from the checkout's ref."
-
-      - name: Retry chart-releaser
-        if: failure() && steps.cr.outcome == 'failure'
-        uses: helm/chart-releaser-action@92c6b97fa9f664492a2592e0d1d80bc6bf378957 # v1.9.0
-        with:
-          charts_dir: ${{ inputs.charts-dir }}
-          skip_existing: true
-          mark_as_latest: ${{ steps.mode.outputs.mark_as_latest }}
         env:
           CR_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pkgs=(.cr-release-packages/*.tgz)
+          if (( ${#pkgs[@]} == 0 )); then
+            echo "::error::chart-releaser failed before packaging; nothing to index. See the step above."
+            exit 1
+          fi
+          for pkg in "${pkgs[@]}"; do
+            release=$(basename "$pkg" .tgz)
+            if ! gh release view "$release" --repo "$GITHUB_REPOSITORY" --json assets \
+                --jq '.assets[].name' 2>/dev/null | grep -qxF "${release}.tgz"; then
+              echo "::error::release ${release} has no uploaded ${release}.tgz, so chart-releaser failed before the index push; fix the cause and rerun."
+              exit 1
+            fi
+          done
+          for attempt in 1 2 3; do
+            sleep $((attempt * 15))
+            git fetch origin '+gh-pages:refs/remotes/origin/gh-pages' ||
+              echo "gh-pages not fetched (a first release creates it)."
+            if cr index --owner "${GITHUB_REPOSITORY%%/*}" --git-repo "${GITHUB_REPOSITORY#*/}" --push; then
+              echo "Index pushed on retry ${attempt}."
+              exit 0
+            fi
+            echo "::warning::index push retry ${attempt} failed."
+          done
+          echo "::error::the gh-pages index push failed 3 more times; rerun this job."
+          exit 1

@@ -701,7 +701,9 @@ jobs:
             if [[ "$STATE" == present ]]; then
               continue
             fi
-            docker buildx imagetools create -t "$ref" "$sha_ref"
+            # --prefer-index=false: a carbon copy, so every tag of one build has the same digest
+            # (by default a single-platform manifest would be wrapped in a new index).
+            docker buildx imagetools create --prefer-index=false -t "$ref" "$sha_ref"
             echo "Created ${ref} from ${sha_ref}."
           done <<< "$TAGS"
           echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -1027,7 +1029,8 @@ jobs:
                 echo "::error::${sha_ref} does not exist, so ${dest}:${VERSION_TAG} cannot be tagged from it."
                 exit 1
               fi
-              docker buildx imagetools create -t "${dest}:${VERSION_TAG}" "$sha_ref"
+              # --prefer-index=false: the same digest as sha-<8>, not a new index around it.
+              docker buildx imagetools create --prefer-index=false -t "${dest}:${VERSION_TAG}" "$sha_ref"
               echo "Created ${dest}:${VERSION_TAG} from ${sha_ref}."
               created=$((created + 1))
             done
