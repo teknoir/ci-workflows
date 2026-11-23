@@ -1,0 +1,316 @@
+name: image (reusable)
+
+# Builds one image and pushes it as sha-<8>:
+#   private: harbor.teknoir.cloud/teknoir/<image> and ghcr.io/teknoir/<image>,
+#            from refs/heads/main only (the teknoir-push runner admits nothing
+#            else) and with no second tag. A later release re-tags the digest
+#            built on main with `docker buildx imagetools create`; that is not
+#            part of this round.
+#   public:  ghcr.io/teknoir/<image>, from refs/heads/main or a refs/tags/v*
+#            tag that is on origin/main; a tag also pushes :<tag name>.
+# Never pushes latest or a branch-name tag. Runs on teknoir-push for private
+# repos (its pod carries BUILDKIT_HOST and the Harbor push robot).
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Repository name without registry, e.g. backstage.
+        type: string
+        required: true
+      context:
+        description: Docker build context.
+        type: string
+        default: .
+      file:
+        description: Dockerfile path, relative to the repo root.
+        type: string
+        default: Dockerfile
+      platforms:
+        description: Target platforms, comma separated.
+        type: string
+        default: linux/amd64
+      target:
+        description: Dockerfile build target. Empty builds the last stage.
+        type: string
+        default: ''
+      build-args:
+        description: Build args, one KEY=VALUE per line.
+        type: string
+        default: ''
+      pre-build:
+        description: >-
+          Shell command to run before a public build. Private builds refuse it:
+          it would run next to the Harbor push credential.
+        type: string
+        default: ''
+      lfs:
+        description: Check out Git LFS files.
+        type: boolean
+        default: false
+      visibility:
+        description: private pushes to Harbor and ghcr; public pushes to public ghcr only.
+        type: string
+        default: private
+      runs-on:
+        description: Runner label or ARC scale-set name.
+        type: string
+        default: teknoir-push
+      timeout-minutes:
+        description: Job timeout in minutes.
+        type: number
+        default: 60
+    outputs:
+      digest:
+        description: Digest of the pushed image.
+        value: ${{ jobs.image.outputs.digest }}
+      tag:
+        description: Tag of the pushed image (sha-<8>).
+        value: ${{ jobs.image.outputs.tag }}
+
+permissions: {}
+
+jobs:
+  image:
+    name: image
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest || steps.exists.outputs.digest }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      # No credentials on disk: the one fetch that needs them runs below in
+      # the public tag branch, where the repository is public.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          lfs: ${{ inputs.lfs }}
+          persist-credentials: false
+
+      - name: Refuse refs that are not allowed for this visibility
+        shell: bash
+        env:
+          VISIBILITY: ${{ inputs.visibility }}
+          PRE_BUILD: ${{ inputs.pre-build }}
+        run: |
+          set -euo pipefail
+          if [[ "${VISIBILITY}" == private && -n "${PRE_BUILD}" ]]; then
+            echo '::error::private builds run every step in the Dockerfile; pre-build would run next to the Harbor push robot'
+            exit 1
+          fi
+          if [[ "${VISIBILITY}" == private ]]; then
+            if [[ "${GITHUB_REF}" == refs/heads/main ]]; then
+              echo "Building main."
+            else
+              echo "::error::private images build only refs/heads/main; teknoir-push refuses ${GITHUB_REF}."
+              exit 1
+            fi
+          elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
+            echo "HEAD is on origin/main."
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # The only branch that needs origin/main; the repo is public here,
+            # so the fetch is anonymous (the checkout kept no credentials).
+            git fetch --no-tags origin main
+            if git merge-base --is-ancestor HEAD origin/main; then
+              echo "Building tag ${GITHUB_REF#refs/tags/}, which is on origin/main."
+            else
+              echo "::error::tag ${GITHUB_REF#refs/tags/} is not on origin/main; build it from a tag cut from main."
+              exit 1
+            fi
+          else
+            echo "::error::public images build refs/heads/main or a refs/tags/v* tag on main; ${GITHUB_REF} is neither."
+            exit 1
+          fi
+
+      - name: Compute tags and source date
+        id: meta
+        shell: bash
+        env:
+          VISIBILITY: ${{ inputs.visibility }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          tag="sha-${GITHUB_SHA::8}"
+          epoch=$(git log -1 --format=%ct)
+          if [[ "$tag" == latest ]]; then
+            echo "::error::refusing to build the tag latest."
+            exit 1
+          fi
+          tags=""
+          dests=()
+          if [[ "$VISIBILITY" == private ]]; then
+            dests+=("harbor.teknoir.cloud/teknoir/${IMAGE}")
+            dests+=("ghcr.io/teknoir/${IMAGE}")
+          elif [[ "$VISIBILITY" == public ]]; then
+            dests+=("ghcr.io/teknoir/${IMAGE}")
+          else
+            echo "::error::visibility must be private or public, not '${VISIBILITY}'."
+            exit 1
+          fi
+          for dest in "${dests[@]}"; do
+            [[ "$tag" == latest ]] && { echo "::error::refusing to push latest."; exit 1; }
+            tags+="${dest}:${tag}"$'\n'
+            # Private builds push sha-<8> only: a release re-tags the digest
+            # built on main later (docker buildx imagetools create).
+            if [[ "$VISIBILITY" == public && "${GITHUB_REF}" == refs/tags/v* ]]; then
+              ref_tag="${GITHUB_REF#refs/tags/}"
+              if [[ "$ref_tag" == latest ]]; then
+                echo "::error::refusing to push latest."
+                exit 1
+              fi
+              tags+="${dest}:${ref_tag}"$'\n'
+            fi
+          done
+          {
+            echo "tag=${tag}"
+            echo "first_destination=${dests[0]}"
+            echo "visibility=${VISIBILITY}"
+            echo "source_date_epoch=${epoch}"
+            echo "tags<<EOF"
+            printf '%s' "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
+
+      - name: Bridge the remote BuildKit endpoint
+        if: inputs.visibility == 'private'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${BUILDKIT_HOST:-}" ]]; then
+            echo "::error::BUILDKIT_HOST is empty. Private image builds run on teknoir-push, whose pod sets BUILDKIT_HOST=tcp://buildkitd.buildkit.svc.cluster.local:1234."
+            exit 1
+          fi
+          echo "BUILDKIT_HOST=${BUILDKIT_HOST}" >> "$GITHUB_ENV"
+
+      - name: Set up buildx (private, remote BuildKit)
+        if: inputs.visibility == 'private'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: remote
+          endpoint: ${{ env.BUILDKIT_HOST }}
+
+      - name: Set up QEMU (public, multi-arch)
+        if: inputs.visibility == 'public' && inputs.platforms != 'linux/amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up buildx (public)
+        if: inputs.visibility == 'public'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The teknoir-push pod exports the Harbor push robot; read it directly
+      # here and keep it out of GITHUB_ENV, GITHUB_OUTPUT, `with:` and `env:`.
+      - name: Log in to Harbor
+        if: inputs.visibility == 'private'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${HARBOR_USERNAME:-}" || -z "${HARBOR_PASSWORD:-}" ]]; then
+            echo '::error::teknoir-push pod has no Harbor credential'
+            exit 1
+          fi
+          echo "::add-mask::${HARBOR_PASSWORD}"
+          printf '%s' "$HARBOR_PASSWORD" |
+            docker login harbor.teknoir.cloud -u "$HARBOR_USERNAME" --password-stdin
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # The sha tag is the only thing ever built; the other tags in the list
+      # (a public v* tag) are created from it when it is already there.
+      - name: Skip if the image already exists
+        id: exists
+        shell: bash
+        env:
+          FIRST_DESTINATION: ${{ steps.meta.outputs.first_destination }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          sha_ref="${FIRST_DESTINATION}:${TAG}"
+          if ! docker buildx imagetools inspect "$sha_ref" >/dev/null 2>&1; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          while IFS= read -r ref; do
+            [[ -n "$ref" && "$ref" != "$sha_ref" ]] || continue
+            if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              continue
+            fi
+            docker buildx imagetools create -t "$ref" "$sha_ref"
+            echo "Created ${ref} from ${sha_ref}."
+          done <<< "$TAGS"
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          # A skipped build still publishes a digest for the caller.
+          digest=$(docker buildx imagetools inspect "$sha_ref" \
+            --format '{{json .Manifest}}' | jq -r .digest)
+          if [[ -n "$digest" && "$digest" != null ]]; then
+            echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not read the digest of ${sha_ref}."
+          fi
+          echo "${sha_ref} already exists; skipping the build."
+
+      # Public builds only: a private build runs every Dockerfile step next to
+      # the Harbor push credential, so pre-build is refused there.
+      - name: Pre-build
+        if: >-
+          inputs.pre-build != '' && inputs.visibility == 'public' &&
+          steps.exists.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.pre-build }}
+
+      - name: Build and push
+        id: build
+        if: steps.exists.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          platforms: ${{ inputs.platforms }}
+          target: ${{ inputs.target }}
+          build-args: ${{ inputs.build-args }}
+          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=registry,rewrite-timestamp=true
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          RESULT_TAG: ${{ steps.meta.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest || steps.exists.outputs.digest }}
+          EXISTS: ${{ steps.exists.outputs.exists }}
+          FIRST_DESTINATION: ${{ steps.meta.outputs.first_destination }}
+          BUILD_RESULT: ${{ steps.build.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Image"
+            echo
+            if [[ "${EXISTS}" == true ]]; then
+              echo "${FIRST_DESTINATION}:${RESULT_TAG} already existed; build skipped."
+              if [[ -n "${DIGEST}" ]]; then
+                echo
+                echo "Digest: \`${DIGEST}\`"
+              fi
+            elif [[ "${BUILD_RESULT}" == success ]]; then
+              echo "Pushed ${IMAGE}:${RESULT_TAG}"
+              echo
+              echo "Digest: \`${DIGEST}\`"
+            else
+              echo "Build did not succeed (${BUILD_RESULT:-skipped})."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,165 @@
+name: watch
+
+# Daily check that the pinned actions-runner image in the ARC chart is not too
+# far behind actions/runner. GitHub stops queuing jobs on runners about 30 days
+# old, so the alert fires at 21 days. Opens or updates one `ci-alert` issue.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  runner-age:
+    name: runner-age
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CHART_URL: https://raw.githubusercontent.com/teknoir/platform-applications-gitops/HEAD/charts/ci-runners/arc
+    steps:
+      # Each ARC scale set pins its own copy of the image: check all three and
+      # use the oldest, since GitHub retires runners by image age.
+      - name: Read the pinned runner version
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          pins=()
+          for name in teknoir-ci teknoir-land teknoir-push; do
+            url="${CHART_URL}/${name}.yaml"
+            if ! chart=$(curl -sSfL "$url"); then
+              echo "::error::Could not fetch ${url}."
+              exit 1
+            fi
+            pin=$(printf '%s\n' "$chart" |
+              sed -n 's|.*ghcr\.io/actions/actions-runner:\([^@]*\)@sha256:.*|\1|p' |
+              head -n1)
+            if [[ -z "$pin" ]]; then
+              echo "::error::No actions-runner image line in ${url}."
+              exit 1
+            fi
+            echo "${name}.yaml pins ${pin}."
+            pins+=("$pin")
+          done
+          pinned=$(printf '%s\n' "${pins[@]}" | sort -V | head -n1)
+          echo "pinned=${pinned}" >> "$GITHUB_OUTPUT"
+          echo "Pinned runner image version (oldest of the three): ${pinned}"
+
+      - name: Compare with actions/runner releases
+        id: compare
+        shell: bash
+        env:
+          PINNED: ${{ steps.pin.outputs.pinned }}
+        run: |
+          set -euo pipefail
+
+          # version_key vX.Y.Z -> X*1000000 + Y*1000 + Z, so plain integer compare.
+          version_key() {
+            local v=${1#v} maj min patch rest
+            v=${v%%-*}
+            IFS=. read -r maj min patch rest <<<"$v"
+            printf '%d\n' $(( 10#${maj:-0} * 1000000 + 10#${min:-0} * 1000 + 10#${patch:-0} ))
+          }
+
+          releases=$(gh api repos/actions/runner/releases --paginate \
+            --jq '.[] | select(.prerelease|not) | [.tag_name, .published_at] | @tsv')
+          if [[ -z "$releases" ]]; then
+            echo "::error::No actions/runner releases returned."
+            exit 1
+          fi
+
+          pinned_key=$(version_key "$PINNED")
+          newer=""
+          while IFS=$'\t' read -r tag published; do
+            [[ -n "$tag" ]] || continue
+            if (( $(version_key "$tag") > pinned_key )); then
+              newer+="${tag}"$'\t'"${published}"$'\n'
+            fi
+          done <<<"$releases"
+
+          if [[ -z "$newer" ]]; then
+            echo "too_old=false" >> "$GITHUB_OUTPUT"
+            echo "The pin ${PINNED} is the newest release."
+            exit 0
+          fi
+
+          # The oldest release newer than the pin: that is when the pin started
+          # falling behind. Older than 21 days means it is time to bump.
+          oldest_line=$(printf '%s' "$newer" |
+            sort -k1,1V |
+            head -n1)
+          oldest_at=${oldest_line#*$'\t'}
+          newest_tag=$(printf '%s' "$newer" | sort -k1,1V | tail -n1 | cut -f1)
+          age_days=$(( ( $(date -u +%s) - $(date -u -d "$oldest_at" +%s) ) / 86400 ))
+
+          {
+            echo "pinned=${PINNED}"
+            echo "newest=${newest_tag}"
+            echo "age_days=${age_days}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pin ${PINNED}, newest ${newest_tag}, ${age_days} days behind."
+
+          if (( age_days > 21 )); then
+            echo "too_old=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "too_old=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update the alert
+        if: steps.compare.outputs.too_old == 'true'
+        shell: bash
+        env:
+          PINNED: ${{ steps.compare.outputs.pinned }}
+          NEWEST: ${{ steps.compare.outputs.newest }}
+          AGE_DAYS: ${{ steps.compare.outputs.age_days }}
+        run: |
+          set -euo pipefail
+          title="Runner image ${PINNED} is more than 21 days behind actions/runner"
+          body=$(cat <<EOF
+          The pinned ARC runner image is **${PINNED}**; actions/runner is at **${NEWEST}**
+          (the pin started falling behind ${AGE_DAYS} days ago).
+
+          GitHub stops queuing jobs on runners about 30 days behind. Bump the pin:
+
+          1. PR to \`teknoir/platform-applications-gitops\` updating the \`image:\` line
+             in \`charts/ci-runners/arc/*.yaml\` (\`ghcr.io/actions/actions-runner:<ver>@sha256:...\`).
+          2. After the merge, \`helm upgrade\` per \`charts/ci-runners/README.md\`.
+
+          This issue is updated, not reopened, while the pin stays old.
+          EOF
+          )
+          gh label create ci-alert --force \
+            --color B60205 --description 'CI needs a hand' >/dev/null 2>&1 ||
+            echo "::notice::Could not ensure the ci-alert label exists."
+          existing=$(gh issue list --label ci-alert --state open --limit 100 \
+            --json number,title --jq '.[] | select(.title | startswith("Runner image")) | .number' |
+            head -n1)
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "Still behind: ${body}"
+          else
+            gh issue create --title "$title" --label ci-alert --body "$body"
+          fi
+
+      - name: Close a stale alert
+        if: steps.compare.outputs.too_old == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --label ci-alert --state open --limit 100 \
+            --json number,title --jq '.[] | select(.title | startswith("Runner image")) | .number')
+          if [[ -z "$open" ]]; then
+            echo "No open runner-age alert."
+            exit 0
+          fi
+          while IFS= read -r number; do
+            [[ -n "$number" ]] || continue
+            gh issue comment "$number" --body "The pinned runner image is now within 21 days of actions/runner. Closing."
+            gh issue close "$number"
+          done <<<"$open"
