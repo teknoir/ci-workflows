@@ -39,10 +39,10 @@ jobs:
               exit 1
             fi
             pin=$(printf '%s\n' "$chart" |
-              sed -n 's|.*ghcr\.io/actions/actions-runner:\([^@]*\)@sha256:.*|\1|p' |
+              sed -nE 's#.*ghcr\.io/(actions/actions-runner|teknoir/ci-runner):([0-9]+\.[0-9]+\.[0-9]+)[^@]*@sha256:.*#\2#p' |
               head -n1)
             if [[ -z "$pin" ]]; then
-              echo "::error::No actions-runner image line in ${url}."
+              echo "::error::No actions-runner or teknoir/ci-runner image line in ${url}."
               exit 1
             fi
             echo "${name}.yaml pins ${pin}."
@@ -128,8 +128,9 @@ jobs:
 
           GitHub stops queuing jobs on runners about 30 days behind. Bump the pin:
 
-          1. PR to \`teknoir/platform-applications-gitops\` updating the \`image:\` line
-             in \`charts/ci-runners/arc/*.yaml\` (\`ghcr.io/actions/actions-runner:<ver>@sha256:...\`).
+          1. Bump \`BASE\` in \`teknoir/ci-workflows\` \`runner-image/Dockerfile\`, build and push
+             \`ghcr.io/teknoir/ci-runner:<ver>-<n>\`, then PR to \`teknoir/platform-applications-gitops\`
+             updating the \`image:\` line in \`charts/ci-runners/arc/*.yaml\` (\`ghcr.io/teknoir/ci-runner:<ver>-<n>@sha256:...\`).
           2. After the merge, \`helm upgrade\` per \`charts/ci-runners/README.md\`.
 
           This issue is updated, not reopened, while the pin stays old.
