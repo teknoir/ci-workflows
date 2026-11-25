@@ -386,16 +386,35 @@ from the YAML, against a stub registry and an emulation of the runner's
 `GITHUB_OUTPUT` parser), and a diff of every inline `image-lib` copy in
 `image.yml` against `scripts/image-lib.sh`.
 
+The runner image is no longer bumped by hand: Dependabot bumps the
+`actions-runner` `FROM` line in `runner-image/Dockerfile` weekly
+(`.github/dependabot.yml`), a merge to `main` builds
+`ghcr.io/teknoir/ci-runner:sha-<8>` (`runner-image.yml` below), and Kargo's
+`pin-ci-runner` Stage pins it into the three ARC files. The daily check is the
+backstop.
+
 ### `watch.yml` (this repo)
 
-Daily (06:17 UTC) check of the `actions-runner` image pinned in
+Daily (06:17 UTC) backstop for the `actions-runner` image pinned in
 `teknoir/platform-applications-gitops` `charts/ci-runners/arc/teknoir-ci.yaml`,
 `teknoir-land.yaml` and `teknoir-push.yaml`; the oldest of the three pins is
 the one compared, since GitHub retires runners by image age. A fetch or parse
 failure is an `::error::` and fails the run. GitHub stops queuing jobs on
 runners about 30 days old; when the pin is more than 21 days behind
-`actions/runner`, it opens (or comments on) an issue labelled `ci-alert` with
-the bump procedure, and closes stale ones.
+`actions/runner` (a Dependabot bump PR or its Kargo pin is stuck), it opens (or
+comments on) an issue labelled `ci-alert` with the bump procedure, and closes
+stale ones.
+
+### `runner-image.yml` (this repo)
+
+Builds `ghcr.io/teknoir/ci-runner:sha-<8>`, the dev-host ARC runner image, from
+`runner-image/Dockerfile` on every push to `main` that touches `runner-image/`
+(or `workflow_dispatch`), through `image.yml` with `visibility: public` on
+`ubuntu-latest`. Dependabot bumps the upstream `actions-runner` base image
+(tag and digest) weekly, and Kargo's `pin-ci-runner` Stage in
+platform-applications-gitops pins the result into `charts/ci-runners/arc/*.yaml`.
+The package `ghcr.io/teknoir/ci-runner` must grant this repository write access
+("Manage Actions access") before the first run can push.
 
 ## Caller examples
 

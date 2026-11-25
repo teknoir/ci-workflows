@@ -42,8 +42,26 @@ jobs:
               sed -nE 's#.*ghcr\.io/(actions/actions-runner|teknoir/ci-runner):([0-9]+\.[0-9]+\.[0-9]+)[^@]*@sha256:.*#\2#p' |
               head -n1)
             if [[ -z "$pin" ]]; then
-              echo "::error::No actions-runner or teknoir/ci-runner image line in ${url}."
-              exit 1
+              # A Kargo pin is ghcr.io/teknoir/ci-runner:sha-<8>, built by runner-image.yml from this repository's
+              # commit <8>: the runner version is the actions-runner tag in runner-image/Dockerfile at that commit.
+              short=$(printf '%s\n' "$chart" |
+                sed -nE 's#.*ghcr\.io/teknoir/ci-runner:sha-([0-9a-f]{8})@sha256:.*#\1#p' | head -n1)
+              if [[ -z "$short" ]]; then
+                echo "::error::No actions-runner or teknoir/ci-runner image line in ${url}."
+                exit 1
+              fi
+              if ! full=$(gh api "repos/teknoir/ci-workflows/commits/${short}" --jq .sha); then
+                echo "::error::${url} pins ci-runner:sha-${short}, but no teknoir/ci-workflows commit ${short} was found."
+                exit 1
+              fi
+              pin=$(gh api "repos/teknoir/ci-workflows/contents/runner-image/Dockerfile?ref=${full}" \
+                  -H 'Accept: application/vnd.github.raw' |
+                sed -nE 's#^FROM ghcr\.io/actions/actions-runner:v?([0-9]+\.[0-9]+\.[0-9]+)@.*#\1#p' | head -n1)
+              if [[ -z "$pin" ]]; then
+                echo "::error::runner-image/Dockerfile at teknoir/ci-workflows ${short} has no FROM ghcr.io/actions/actions-runner:<version>@... line."
+                exit 1
+              fi
+              echo "${name}.yaml pins ci-runner:sha-${short} (actions-runner ${pin} at ci-workflows ${short})."
             fi
             echo "${name}.yaml pins ${pin}."
             pins+=("$pin")
@@ -128,10 +146,12 @@ jobs:
 
           GitHub stops queuing jobs on runners about 30 days behind. Bump the pin:
 
-          1. Bump \`BASE\` in \`teknoir/ci-workflows\` \`runner-image/Dockerfile\`, build and push
-             \`ghcr.io/teknoir/ci-runner:<ver>-<n>\`, then PR to \`teknoir/platform-applications-gitops\`
-             updating the \`image:\` line in \`charts/ci-runners/arc/*.yaml\` (\`ghcr.io/teknoir/ci-runner:<ver>-<n>@sha256:...\`).
-          2. After the merge, \`helm upgrade\` per \`charts/ci-runners/README.md\`.
+          1. Land the Dependabot PR in \`teknoir/ci-workflows\` that bumps the \`FROM ghcr.io/actions/actions-runner\`
+             line in \`runner-image/Dockerfile\` (open one by hand if Dependabot has none).
+          2. Check that the \`runner-image\` workflow run on main pushed \`ghcr.io/teknoir/ci-runner:sha-<8>\`.
+          3. Check that Kargo's \`pin-ci-runner\` Stage (r415, namespace \`platform\`) merged its pin PR in
+             \`teknoir/platform-applications-gitops\` and that a \`verified/*\` tag contains it; ArgoCD then rolls
+             the scale sets on devhost-ci.
 
           This issue is updated, not reopened, while the pin stays old.
           EOF

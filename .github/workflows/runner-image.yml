@@ -1,0 +1,38 @@
+name: runner-image
+
+# Builds ghcr.io/teknoir/ci-runner:sha-<8> (the dev-host ARC runner image) from
+# runner-image/Dockerfile on every push to main that touches runner-image/
+# (through the reusable image.yml, visibility public; sha-<8> only, never
+# latest or a branch tag). Dependabot bumps the upstream actions-runner FROM
+# line weekly (.github/dependabot.yml). The package ghcr.io/teknoir/ci-runner
+# must grant this repository write access ("Manage Actions access" in the
+# package settings) before the first run can push, and Kargo's pin-ci-runner
+# Stage in platform-applications-gitops pins the result into
+# charts/ci-runners/arc/*.yaml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - runner-image/**
+      - .github/workflows/runner-image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: runner-image-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: ci-runner
+      context: runner-image
+      file: runner-image/Dockerfile
+      visibility: public
+      runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
