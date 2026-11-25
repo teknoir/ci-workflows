@@ -1,9 +1,13 @@
 # Runner image for the dev-host ARC scale sets (teknoir-ci, teknoir-land, teknoir-push).
 # The upstream actions-runner image has no make, gcc or gh; land.sh needs gh, and most repos need make.
 # shellcheck, openssl, pip, PyYAML, helm, luajit and git-lfs are what the repos' old vpro CI images provided.
-# Bump BASE together with the ARC values in platform-applications-gitops charts/ci-runners/arc/*.yaml.
-ARG BASE=ghcr.io/actions/actions-runner:2.338.2@sha256:6d0b2d80d80f143f77dcb676e50920100bbb547e39e883454d57f45ab8c31300
-FROM ${BASE}
+# Dependabot (weekly, .github/dependabot.yml) bumps the FROM line below; a merge
+# to main builds ghcr.io/teknoir/ci-runner:sha-<8> (.github/workflows/runner-image.yml);
+# Kargo's pin-ci-runner Stage in platform-applications-gitops pins it into
+# charts/ci-runners/arc/*.yaml. GitHub stops sending jobs to runners more than
+# 30 days older than a newer runner release, so a runner bump PR should land
+# within days.
+FROM ghcr.io/actions/actions-runner:2.338.2@sha256:6d0b2d80d80f143f77dcb676e50920100bbb547e39e883454d57f45ab8c31300
 ARG YQ_VERSION=v4.54.3
 ARG HELM_VERSION=v4.3.0
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
